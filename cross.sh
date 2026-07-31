@@ -1,73 +1,50 @@
 #!/bin/bash
-# cross.sh - Minimal containerless development prefix for ChromeOS Developer Mode.
+# cross.sh - Alpine-packages-only development environment for ChromeOS Developer Mode.
 #
-# No package manager, scripting-language bootstrap, chroot, container, or rootfs modification.
-# Everything is installed below CROSS_PREFIX (default: /usr/local/cross), except
-# small shell profile blocks added to the invoking user's ~/.bashrc/.bash_profile.
+# This version performs NO source builds. It installs an official Alpine Linux
+# minirootfs and signed Alpine packages below /usr/local/cross/alpine, then
+# exposes convenient host-side wrappers such as `git`, `cc`, `make`, `rustup`,
+# `node`, and `npm` through a plain chroot launcher.
 #
-# Design:
-#   * Zig supplies a self-contained Clang/LLD + musl target.
-#   * C/C++ tools and the libraries built here are statically linked to musl.
-#   * Git uses a static curl built with Mbed TLS (no OpenSSL/Perl bootstrap).
-#   * rustup/Cargo and nvm/Node live below the same executable prefix because
-#     ChromeOS user-data mounts may be noexec.
+# Runtime characteristics:
+#   * same ChromeOS kernel; no VM, no LXC/Docker, no namespaces
+#   * a chroot is used only to give Alpine binaries their expected /lib and /usr
+#   * the ChromeOS home directory is bind-mounted at the identical path
+#   * all compiler/runtime/library files are obtained from Alpine repositories
 #
-# Run from VT-2 as chronos (do not use sudo for the whole script):
+# Run once from VT-2 as chronos:
 #   bash ~/Downloads/cross.sh
 #
-# Optional settings:
-#   CROSS_PREFIX=/usr/local/cross
-#   CROSS_RUST_TOOLCHAIN=stable
-#   CROSS_INSTALL_NODE=1       # 0 installs nvm but not Node
-#   CROSS_NODE_VERSION=lts/*   # any selector accepted by nvm
-#   CROSS_JOBS=4
+# After setup:
+#   source ~/.bashrc
+#   git --version
+#   cross                 # open an interactive Alpine-backed shell
+#   cross apk info        # inspect installed Alpine packages
+#
+# Important: nvm is not packaged by Alpine stable or Alpine edge/testing.
+# To keep this script strictly Alpine-only, Node.js and npm are installed from
+# Alpine packages instead. rustup itself is an Alpine package; toolchains later
+# installed by rustup are downloaded by rustup from the Rust distribution site.
 
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-07-30.9-mbedtls-direct-install"
-
+SCRIPT_VERSION="2026-07-31.22-apk-script-hardlink-sh"
+ALPINE_VERSION="3.24.1"
+ALPINE_BRANCH="v3.24"
 CROSS_PREFIX="${CROSS_PREFIX:-/usr/local/cross}"
-CROSS_RUST_TOOLCHAIN="${CROSS_RUST_TOOLCHAIN:-stable}"
-CROSS_INSTALL_NODE="${CROSS_INSTALL_NODE:-1}"
-CROSS_NODE_VERSION="${CROSS_NODE_VERSION:-lts/*}"
-CROSS_JOBS="${CROSS_JOBS:-}"
-
-ZIG_VERSION="0.16.0"
-MAKE_VERSION="4.4.1"
-BZIP2_VERSION="1.0.8"
-PKGCONF_VERSION="2.4.3"
-ZLIB_VERSION="1.3.2"
-MBEDTLS_VERSION="3.6.7"
-CURL_VERSION="8.21.0"
-GIT_VERSION="2.55.0"
-NVM_VERSION="v0.40.6"
-
-# Published checksums for immutable upstream release archives.
-MAKE_SHA256="dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
-BZIP2_SHA256="ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269"
-PKGCONF_SHA256="51203d99ed573fa7344bf07ca626f10c7cc094e0846ac4aa0023bd0c83c25a41"
-ZLIB_SHA256="bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
-MBEDTLS_SHA256="a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6"
-CURL_SHA256="d9b327997999045a24cda50f3983e69e51c516bd8be6ef9842fc7f99135e33bb"
-
-BIN="$CROSS_PREFIX/bin"
-LIB="$CROSS_PREFIX/lib"
-INCLUDE="$CROSS_PREFIX/include"
-OPT="$CROSS_PREFIX/opt"
-ETC="$CROSS_PREFIX/etc"
-STATE="$CROSS_PREFIX/var/db/cross"
-CACHE="$CROSS_PREFIX/var/cache/cross"
-BUILD_ROOT="$CROSS_PREFIX/var/tmp/cross-build.$$"
+CROSS_ROOT="$CROSS_PREFIX/alpine"
+CROSS_BIN="$CROSS_PREFIX/bin"
+CROSS_CACHE="$CROSS_PREFIX/cache"
+CROSS_MARKER="$CROSS_PREFIX/.alpine-cross-managed"
+CROSS_COMPLETE="$CROSS_PREFIX/.alpine-cross-complete"
 LOG_FILE="${HOME:-/home/chronos/user}/cross-setup-$(date +%Y%m%d-%H%M%S).log"
 
 HOST_ARCH=""
-ZIG_ARCH=""
-ZIG_TARGET=""
-RUST_HOST=""
-ZIG_SHA256=""
-CA_BUNDLE=""
-BOOTSTRAP_FETCH=""
+ALPINE_ARCH=""
+FETCH_TOOL=""
+CHROOT_BIN=""
+ROOTFS_MOUNTED=()
 
 if command -v tee >/dev/null 2>&1; then
   exec > >(tee -a "$LOG_FILE") 2>&1
@@ -76,19 +53,20 @@ fi
 info() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 cleanup() {
-  local status=$?
-  rm -rf "$BUILD_ROOT" 2>/dev/null || true
+  local status=$? i target
+  for ((i=${#ROOTFS_MOUNTED[@]}-1; i>=0; i--)); do
+    target="${ROOTFS_MOUNTED[$i]}"
+    sudo umount -l "$target" >/dev/null 2>&1 || true
+  done
   if (( status != 0 )); then
     printf '\nSetup failed. Log: %s\n' "$LOG_FILE" >&2
   fi
-  exit "$status"
 }
 trap cleanup EXIT
 trap 'die "line ${LINENO}: command failed: ${BASH_COMMAND}"' ERR
-
-have() { command -v "$1" >/dev/null 2>&1; }
 
 sha256_file() {
   local file="$1"
@@ -97,773 +75,650 @@ sha256_file() {
   elif have openssl; then
     openssl dgst -sha256 "$file" | awk '{print $NF}'
   else
-    die "sha256sum or openssl is required to verify downloads"
+    die "sha256sum or openssl is required"
   fi
-}
-
-verify_sha256() {
-  local file="$1" expected="$2" actual
-  [[ -n "$expected" ]] || return 0
-  actual="$(sha256_file "$file")"
-  [[ "$actual" == "$expected" ]] || {
-    rm -f "$file"
-    die "SHA-256 mismatch for ${file##*/}: expected $expected, got $actual"
-  }
 }
 
 fetch() {
-  local url="$1" out="$2" expected="${3:-}"
+  local url="$1" out="$2"
   mkdir -p "$(dirname "$out")"
-  if [[ -s "$out" ]]; then
-    if [[ -z "$expected" ]] || [[ "$(sha256_file "$out")" == "$expected" ]]; then
-      return 0
-    fi
-    rm -f "$out"
-  fi
-
+  [[ -s "$out" ]] && return 0
   info "Downloading ${out##*/}"
-  if [[ -x "$BIN/curl" ]]; then
-    env -u LD_LIBRARY_PATH "$BIN/curl" \
-      --fail --location --show-error --silent --retry 5 --retry-delay 2 \
-      --proto '=https' --tlsv1.2 --output "$out.part" "$url"
-  elif [[ "$BOOTSTRAP_FETCH" == curl ]]; then
-    env -u LD_LIBRARY_PATH curl \
-      --fail --location --show-error --silent --retry 5 --retry-delay 2 \
-      --proto '=https' --tlsv1.2 --output "$out.part" "$url"
-  elif [[ "$BOOTSTRAP_FETCH" == wget ]]; then
-    env -u LD_LIBRARY_PATH wget --https-only --tries=5 --output-document="$out.part" "$url"
-  else
-    die "curl or wget is required for the initial bootstrap"
-  fi
+  rm -f "$out.part"
+  case "$FETCH_TOOL" in
+    curl)
+      env -u LD_LIBRARY_PATH curl --fail --location --show-error --silent \
+        --retry 5 --retry-delay 2 --proto '=https' --tlsv1.2 \
+        --output "$out.part" "$url"
+      ;;
+    wget)
+      env -u LD_LIBRARY_PATH wget --https-only --tries=5 \
+        --output-document="$out.part" "$url"
+      ;;
+    *) die "no download tool selected" ;;
+  esac
   [[ -s "$out.part" ]] || die "empty download: $url"
   mv "$out.part" "$out"
-  verify_sha256 "$out" "$expected"
 }
 
-extract_archive() {
-  local archive="$1" dest="$2"
-  rm -rf "$dest"
-  mkdir -p "$dest"
-  case "$archive" in
-    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$dest" ;;
-    *.tar.xz)
-      if tar -xJf "$archive" -C "$dest" 2>/dev/null; then :
-      elif have xz; then xz -dc "$archive" | tar -xf - -C "$dest"
-      else die "tar cannot unpack xz and no xz command is available"
-      fi
-      ;;
-    *.tar.bz2)
-      if [[ -x "$BIN/bzip2" ]]; then "$BIN/bzip2" -dc "$archive" | tar -xf - -C "$dest"
-      else tar -xjf "$archive" -C "$dest"
-      fi
-      ;;
-    *) die "unsupported archive format: $archive" ;;
-  esac
+is_mounted() {
+  local target="$1"
+  awk -v target="$target" '$2 == target { found=1 } END { exit !found }' /proc/mounts
 }
 
-first_source_dir() {
-  find "$1" -mindepth 1 -maxdepth 1 -type d -print -quit
-}
-
-marker_file() { printf '%s/%s.version' "$STATE" "$1"; }
-component_ready() {
-  local name="$1" version="$2" proof="$3" marker
-  marker="$(marker_file "$name")"
-  [[ -e "$proof" && -f "$marker" && "$(cat "$marker")" == "$version" ]]
-}
-mark_done() { printf '%s\n' "$2" > "$(marker_file "$1")"; }
-
-run_make() { "$BIN/make" -j"$CROSS_JOBS" "$@"; }
-
-find_ca_bundle() {
-  local f
-  for f in \
-    /etc/ssl/certs/ca-certificates.crt \
-    /etc/ssl/cert.pem \
-    /usr/share/chromeos-ca-certificates/roots.pem \
-    /usr/share/chromeos-ca-certificates/ca-certificates.crt; do
-    if [[ -s "$f" ]]; then
-      CA_BUNDLE="$f"
-      return 0
+mount_bind() {
+  local source="$1" target="$2" recursive="${3:-0}"
+  sudo mkdir -p "$target"
+  if ! is_mounted "$target"; then
+    if [[ "$recursive" == 1 ]]; then
+      sudo mount --rbind "$source" "$target"
+      sudo mount --make-rslave "$target" 2>/dev/null || true
+    else
+      sudo mount --bind "$source" "$target"
     fi
-  done
-  f="$(find /usr/share/chromeos-ca-certificates /etc/ssl -type f \( -name '*.pem' -o -name '*.crt' \) -size +20k -print -quit 2>/dev/null || true)"
-  [[ -n "$f" ]] || die "could not find a ChromeOS CA certificate bundle"
-  CA_BUNDLE="$f"
+    ROOTFS_MOUNTED+=("$target")
+  fi
 }
 
-mount_options_for_usr_local() {
-  if have findmnt; then
-    findmnt -n -o OPTIONS /usr/local 2>/dev/null || true
-  else
-    awk '$2 == "/usr/local" { options=$4 } END { print options }' /proc/mounts 2>/dev/null
+mount_proc() {
+  local target="$1"
+  sudo mkdir -p "$target"
+  if ! is_mounted "$target"; then
+    sudo mount -t proc proc "$target"
+    ROOTFS_MOUNTED+=("$target")
+  fi
+}
+
+# Alpine package scripts use #!/bin/sh and apk invokes them directly. On some
+# ChromeOS kernels, an executable script inside the chroot is rejected when its
+# shebang interpreter (/bin/sh) is itself a symlink on the stateful partition,
+# even though the BusyBox ELF target executes normally. Preserve Alpine's
+# BusyBox shell semantics while avoiding that extra symlink traversal by making
+# /bin/sh a hard link to /bin/busybox. Proceed only after a real direct-script
+# execution probe succeeds.
+ensure_apk_script_exec() {
+  local execdir="$CROSS_ROOT/lib/apk/exec"
+  local probe="$execdir/.cross-exec-probe"
+  local altprobe="$execdir/.cross-exec-probe-busybox"
+  local marker="$CROSS_ROOT/etc/.cross-bin-sh-hardlink"
+
+  relink_busybox_sh() {
+    [[ -x "$CROSS_ROOT/bin/busybox" ]] || die "Alpine BusyBox is unavailable"
+    if [[ -L "$CROSS_ROOT/bin/sh" ]] || [[ ! -e "$CROSS_ROOT/bin/sh" ]] || \
+       [[ "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/sh" 2>/dev/null || true)" != \
+          "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/busybox")" ]]; then
+      sudo rm -f "$CROSS_ROOT/bin/sh"
+      sudo ln "$CROSS_ROOT/bin/busybox" "$CROSS_ROOT/bin/sh" \
+        || die "cannot create the Alpine /bin/sh BusyBox hard link"
+    fi
+    sudo chmod 0755 "$CROSS_ROOT/bin/busybox" "$CROSS_ROOT/bin/sh"
+    [[ ! -L "$CROSS_ROOT/bin/sh" ]] || die "Alpine /bin/sh is still a symbolic link"
+    [[ "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/sh")" == \
+       "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/busybox")" ]] \
+      || die "Alpine /bin/sh is not hard-linked to BusyBox"
+  }
+
+  # Once this ChromeOS-specific mode has been selected, keep the hard link in
+  # sync after future BusyBox upgrades replace /bin/busybox with a new inode.
+  [[ -f "$marker" ]] && relink_busybox_sh
+
+  sudo mkdir -p "$execdir"
+  printf '%s\n' '#!/bin/sh' 'exit 0' | sudo tee "$probe" >/dev/null
+  sudo chmod 0755 "$probe"
+
+  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
+    sudo rm -f "$probe"
+    return 0
+  fi
+
+  warn "Direct Alpine shell scripts are denied; replacing /bin/sh symlink with a BusyBox hard link"
+  relink_busybox_sh
+  sudo touch "$marker"
+
+  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
+    sudo rm -f "$probe"
+    return 0
+  fi
+
+  # Distinguish a remaining /bin/sh issue from a blanket script-execution ban.
+  printf '%s\n' '#!/bin/busybox sh' 'exit 0' | sudo tee "$altprobe" >/dev/null
+  sudo chmod 0755 "$altprobe"
+  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe-busybox >/dev/null 2>&1; then
+    sudo rm -f "$probe" "$altprobe"
+    die "ChromeOS accepts a BusyBox shebang but still rejects #!/bin/sh"
+  fi
+
+  sudo rm -f "$probe" "$altprobe"
+  die "ChromeOS denies direct script execution inside the Alpine rootfs even with a non-symlink interpreter"
+}
+# ChromeOS blocks symlink traversal on the stateful partition by default.
+# Alpine root filesystems contain essential symlinks (for example /bin/sh and
+# the musl loader), so a chroot may otherwise fail with execve(EACCES).
+# Developer Mode already treats /mnt/stateful_partition/dev_image as the
+# executable /usr/local tree; this adds the matching runtime exception when the
+# current ChromeOS build did not retain it for nested chroot resolution.
+ensure_chroot_exec() {
+  local security_mnt="/sys/kernel/security"
+  local policy_dir="$security_mnt/chromiumos/inode_security_policies"
+  local policy_file="$policy_dir/allow_symlink"
+  local mounted_here=0 remounted_rw=0 security_opts=""
+
+  [[ -x "$CROSS_ROOT/bin/busybox" ]] \
+    || die "Alpine /bin/busybox is missing or not executable"
+
+  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/busybox true >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "ChromeOS denied chroot exec; enabling the Developer Mode symlink exception for /usr/local"
+
+  sudo mkdir -p "$security_mnt"
+  if ! awk -v target="$security_mnt" '$2 == target { found=1 } END { exit !found }' /proc/mounts; then
+    sudo mount -t securityfs -o nodev,noexec,nosuid securityfs "$security_mnt" \
+      || die "cannot mount ChromeOS securityfs to configure symlink policy"
+    mounted_here=1
+  fi
+
+  security_opts="$(awk -v target="$security_mnt" '$2 == target { print $4; exit }' /proc/mounts)"
+  if [[ ",${security_opts}," == *,ro,* ]]; then
+    sudo mount -o remount,rw "$security_mnt" \
+      || die "cannot temporarily remount $security_mnt read-write"
+    remounted_rw=1
+  fi
+
+  [[ -e "$policy_file" ]] \
+    || die "ChromeOS allow_symlink policy interface is unavailable: $policy_file"
+
+  # First grant the narrow Developer Mode subtree used by /usr/local.
+  printf '%s' '/mnt/stateful_partition/dev_image' | sudo tee "$policy_file" >/dev/null
+
+  # Some ChromeOS releases resolve the chroot path against the parent stateful
+  # mount. Only broaden the temporary exception if the narrow rule is not enough.
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/busybox true >/dev/null 2>&1; then
+    warn "The narrow dev_image rule was insufficient; allowing stateful symlinks until reboot"
+    printf '%s' '/mnt/stateful_partition' | sudo tee "$policy_file" >/dev/null
+  fi
+
+  if (( remounted_rw )); then
+    sudo mount -o remount,ro "$security_mnt" >/dev/null 2>&1 || true
+  fi
+  if (( mounted_here )); then
+    sudo umount "$security_mnt" >/dev/null 2>&1 || true
+  fi
+
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/busybox true >/dev/null 2>&1; then
+    sudo ls -l "$CROSS_ROOT/bin/busybox" "$CROSS_ROOT/sbin/apk" \
+      "$CROSS_ROOT/lib/ld-musl-${ALPINE_ARCH}.so.1" 2>/dev/null || true
+    awk '$2 == "/usr/local" || $2 == "/mnt/stateful_partition" {print}' /proc/mounts >&2 || true
+    die "ChromeOS still denies execution inside the Alpine rootfs"
   fi
 }
 
 preflight() {
+  info "cross.sh $SCRIPT_VERSION"
   info "Preflight checks"
-  (( EUID != 0 )) || die "run as chronos, not as root; the script invokes sudo only to create the prefix"
+
+  (( EUID != 0 )) || die "run as chronos, not as root"
   [[ -f /etc/lsb-release ]] || die "this does not look like the ChromeOS host"
-
-  local user no_new_privs devsw opts free_kib
-  user="$(id -un)"
-  [[ "$user" == chronos ]] || warn "expected user 'chronos', got '$user'"
-
-  no_new_privs="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
-  [[ "$no_new_privs" != 1 ]] || die "NoNewPrivs is active; run from VT-2, not the browser crosh shell"
-
-  if have crossystem; then
-    devsw="$(crossystem devsw_boot 2>/dev/null || true)"
-    [[ -z "$devsw" || "$devsw" == 1 ]] || die "Developer Mode was not detected (devsw_boot=$devsw)"
-  fi
-
-  case "$(uname -m)" in
-    x86_64)
-      HOST_ARCH=x86_64
-      ZIG_ARCH=x86_64
-      ZIG_TARGET=x86_64-linux-musl
-      RUST_HOST=x86_64-unknown-linux-gnu
-      ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
-      ;;
-    aarch64|arm64)
-      HOST_ARCH=aarch64
-      ZIG_ARCH=aarch64
-      ZIG_TARGET=aarch64-linux-musl
-      RUST_HOST=aarch64-unknown-linux-gnu
-      ZIG_SHA256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
-      ;;
-    *) die "supported architectures are x86_64 and aarch64; got $(uname -m)" ;;
-  esac
-
-  if have curl; then BOOTSTRAP_FETCH=curl
-  elif have wget; then BOOTSTRAP_FETCH=wget
-  else die "ChromeOS curl or wget is required for the first download"
-  fi
-
+  have sudo || die "sudo is required; run from VT-2 in Developer Mode"
   have tar || die "tar is required"
-  have sudo || die "sudo is required in VT-2"
+  if have chroot; then
+    CHROOT_BIN="$(command -v chroot)"
+  elif [[ -x /usr/sbin/chroot ]]; then
+    CHROOT_BIN="/usr/sbin/chroot"
+  else
+    die "chroot is required"
+  fi
 
-  opts="$(mount_options_for_usr_local)"
-  [[ -n "$opts" ]] || warn "could not inspect /usr/local mount options"
-  [[ ",$opts," != *,noexec,* ]] || die "/usr/local is mounted noexec; Developer Mode dev_image mount is not active"
+  local nnp opts free_kib
+  nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
+  [[ "$nnp" != 1 ]] || die "NoNewPrivs is active; run from VT-2, not browser crosh"
 
-  case "$CROSS_PREFIX" in
-    /usr/local/*) ;;
-    *) die "CROSS_PREFIX must be below /usr/local so installed programs are executable on ChromeOS" ;;
+  sudo true
+
+  if have curl; then
+    FETCH_TOOL="curl"
+  elif have wget; then
+    FETCH_TOOL="wget"
+  else
+    die "curl or wget is required for the initial Alpine download"
+  fi
+
+  HOST_ARCH="$(uname -m)"
+  case "$HOST_ARCH" in
+    aarch64|arm64) ALPINE_ARCH="aarch64" ;;
+    x86_64|amd64) ALPINE_ARCH="x86_64" ;;
+    *) die "unsupported architecture: $HOST_ARCH" ;;
   esac
 
-  free_kib="$(df -Pk /usr/local 2>/dev/null | awk 'NR==2 {print $4}')"
-  if [[ "$free_kib" =~ ^[0-9]+$ ]] && (( free_kib < 4 * 1024 * 1024 )); then
-    die "at least roughly 4 GiB free under the stateful partition is required"
-  fi
+  opts="$(awk '$2 == "/usr/local" {print $4}' /proc/mounts | tail -n1)"
+  [[ ",${opts}," != *,noexec,* ]] || die "/usr/local is mounted noexec"
 
-  find_ca_bundle
-  printf 'Architecture: %s\nPrefix:       %s\nCA bundle:    %s\n' "$HOST_ARCH" "$CROSS_PREFIX" "$CA_BUNDLE"
+  free_kib="$(df -Pk /usr/local | awk 'NR==2 {print $4}')"
+  [[ "$free_kib" =~ ^[0-9]+$ ]] || free_kib=0
+  (( free_kib >= 1200000 )) || die "at least 1.2 GiB free space under /usr/local is required"
+
+  printf 'Architecture: %s\n' "$ALPINE_ARCH"
+  printf 'Alpine:       %s\n' "$ALPINE_VERSION"
+  printf 'Prefix:       %s\n' "$CROSS_PREFIX"
 }
 
-prepare_prefix() {
-  info "Preparing $CROSS_PREFIX"
-  if [[ ! -d "$CROSS_PREFIX" ]]; then
-    sudo mkdir -p "$CROSS_PREFIX"
-  fi
-  if [[ ! -w "$CROSS_PREFIX" ]]; then
-    sudo chown -R "$(id -u):$(id -g)" "$CROSS_PREFIX"
-  fi
-  mkdir -p "$BIN" "$LIB" "$INCLUDE" "$OPT" "$ETC" "$STATE" "$CACHE" "$BUILD_ROOT"
+reset_or_prepare_prefix() {
+  info "Preparing Alpine-only prefix"
 
-  if [[ -z "$CROSS_JOBS" ]]; then
-    CROSS_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf 2)"
-  fi
-  [[ "$CROSS_JOBS" =~ ^[1-9][0-9]*$ ]] || die "CROSS_JOBS must be a positive integer"
-}
-
-install_zig() {
-  local name="zig-$ZIG_ARCH-linux-$ZIG_VERSION"
-  local archive="$CACHE/$name.tar.xz"
-  local install="$OPT/zig-$ZIG_VERSION"
-  local work="$BUILD_ROOT/zig"
-  local system_nm="" candidate
-
-  if component_ready zig "$ZIG_VERSION-$HOST_ARCH" "$install/zig"; then
-    info "Zig $ZIG_VERSION already installed"
-  else
-    fetch "https://ziglang.org/download/$ZIG_VERSION/$name.tar.xz" "$archive" "$ZIG_SHA256"
-    extract_archive "$archive" "$work"
-    rm -rf "$install"
-    mv "$(first_source_dir "$work")" "$install"
-    mark_done zig "$ZIG_VERSION-$HOST_ARCH"
-  fi
-  ln -sfn "$install/zig" "$BIN/zig"
-
-  # Do not force -static in the compiler wrapper.  Autoconf performs many
-  # feature/linker probes, and an unconditional -static changes or breaks some
-  # of those probes.  Components that need a static final executable pass
-  # -static through their own LDFLAGS instead.
-  # Autoconf/libtool asks a GCC-compatible driver for its linker with
-  # `-print-prog-name=ld`.  Zig normally reports the relative name `ld.lld`,
-  # but the Zig archive does not install a standalone ld.lld executable in
-  # PATH.  Return our absolute wrapper path so configure can validate it.
-  cat > "$BIN/cc" <<WRAPPER
-#!/bin/sh
-case "\${1-}" in
-  -print-prog-name=ld|--print-prog-name=ld)
-    printf '%s\n' "$BIN/ld.lld"
-    exit 0
-    ;;
-esac
-exec "$BIN/zig" cc -target "$ZIG_TARGET" "\$@"
-WRAPPER
-  cat > "$BIN/c++" <<WRAPPER
-#!/bin/sh
-case "\${1-}" in
-  -print-prog-name=ld|--print-prog-name=ld)
-    printf '%s\n' "$BIN/ld.lld"
-    exit 0
-    ;;
-esac
-exec "$BIN/zig" c++ -target "$ZIG_TARGET" "\$@"
-WRAPPER
-  cat > "$BIN/ld.lld" <<WRAPPER
-#!/bin/sh
-exec "$BIN/zig" ld.lld "\$@"
-WRAPPER
-  cat > "$BIN/ar" <<WRAPPER
-#!/bin/sh
-exec "$BIN/zig" ar "\$@"
-WRAPPER
-  cat > "$BIN/ranlib" <<WRAPPER
-#!/bin/sh
-exec "$BIN/zig" ranlib "\$@"
-WRAPPER
-  cat > "$BIN/objcopy" <<WRAPPER
-#!/bin/sh
-exec "$BIN/zig" objcopy "\$@"
-WRAPPER
-  chmod 0755 \
-    "$BIN/cc" "$BIN/c++" "$BIN/ld.lld" "$BIN/ar" \
-    "$BIN/ranlib" "$BIN/objcopy"
-  ln -sfn ld.lld "$BIN/ld"
-
-  # Zig exposes ar/ranlib/objcopy/LLD, but Zig 0.16 does not expose an nm
-  # frontend.  Some ChromeOS images also omit both nm and llvm-nm.  That is not
-  # fatal for this static-only bootstrap: GNU make, bzip2, zlib, Mbed TLS, curl,
-  # and Git perform their actual links with CC/AR/RANLIB.  Autoconf/Libtool may
-  # still probe NM, so provide a successful no-output compatibility shim when
-  # no real implementation exists.  This deliberately disables symbol-table
-  # inspection rather than pretending to provide it.
-  rm -f "$BIN/nm"
-  for candidate in /usr/bin/llvm-nm /usr/bin/nm /bin/llvm-nm /bin/nm; do
-    if [[ -x "$candidate" ]]; then
-      system_nm="$candidate"
-      break
+  if [[ -d "$CROSS_PREFIX" && ! -f "$CROSS_MARKER" ]]; then
+    if [[ -d "$CROSS_PREFIX/var/db/cross" || -d "$CROSS_PREFIX/opt/zig-0.16.0" ]] \
+      || compgen -G "$CROSS_PREFIX/opt/alpine-make-*" >/dev/null; then
+      local backup="${CROSS_PREFIX}.source-build-backup-$(date +%Y%m%d-%H%M%S)"
+      warn "Moving the previous source-built environment to $backup"
+      sudo mv "$CROSS_PREFIX" "$backup"
+    elif [[ -n "$(find "$CROSS_PREFIX" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+      die "$CROSS_PREFIX exists but is not recognized as a cross.sh-managed prefix"
     fi
-  done
-  if [[ -n "$system_nm" ]]; then
-    ln -s "$system_nm" "$BIN/nm"
-  else
-    cat > "$BIN/nm" <<'WRAPPER'
-#!/bin/sh
-# cross.sh fallback for ChromeOS images without nm/llvm-nm.
-# Static-only builds can proceed without symbol-table inspection.
-case "${1-}" in
-  --version|-V)
-    printf '%s\n' 'cross.sh nm compatibility stub (no symbol output)'
-    ;;
-  --help|-h)
-    printf '%s\n' 'nm unavailable on this ChromeOS image; this stub exits successfully without output.'
-    ;;
-esac
-exit 0
-WRAPPER
-    chmod 0755 "$BIN/nm"
-    warn "nm/llvm-nm is absent; using a no-output NM shim suitable for this static-only build"
-  fi
-  ln -sfn cc "$BIN/musl-cc"
-  ln -sfn c++ "$BIN/musl-c++"
-
-  export PATH="$BIN:$PATH"
-  export CC="$BIN/cc" CXX="$BIN/c++" LD="$BIN/ld.lld"
-  export AR="$BIN/ar" RANLIB="$BIN/ranlib" NM="$BIN/nm" OBJCOPY="$BIN/objcopy"
-
-  # Fail here with the actual compiler output instead of later as a vague
-  # Autoconf "C compiler cannot create executables" message.
-  local probe_c="$BUILD_ROOT/zig-cc-probe.c" probe_bin="$BUILD_ROOT/zig-cc-probe"
-  cat > "$probe_c" <<'C'
-#include <stdio.h>
-int main(void) { puts("zig cc probe OK"); return 0; }
-C
-  if ! "$CC" -O2 "$probe_c" -o "$probe_bin"; then
-    "$BIN/zig" version >&2 || true
-    die "Zig C compiler probe failed for target $ZIG_TARGET"
-  fi
-  if ! "$probe_bin" >/dev/null; then
-    die "Zig produced a binary that this ChromeOS host cannot execute"
   fi
 
-  # Verify the direct LLD frontend as well: GNU configure/libtool probes it
-  # independently even though normal final links are performed by zig cc.
-  if [[ "$("$CC" -print-prog-name=ld 2>/dev/null || true)" != "$LD" ]]; then
-    die "Zig compiler driver did not report the expected linker: $LD"
-  fi
-  if ! "$LD" --version >/dev/null 2>&1; then
-    die "Zig LLD frontend is unavailable through $LD"
-  fi
+  sudo mkdir -p "$CROSS_PREFIX" "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_CACHE"
+  sudo chown "$(id -u):$(id -g)" "$CROSS_PREFIX" "$CROSS_BIN" "$CROSS_CACHE"
+  printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_MARKER"
 }
 
-install_make() {
-  local archive="$CACHE/make-$MAKE_VERSION.tar.gz" work="$BUILD_ROOT/make" src
-  if component_ready make "$MAKE_VERSION" "$BIN/make"; then
-    info "GNU make $MAKE_VERSION already installed"
-    return
-  fi
-  fetch "https://ftp.gnu.org/gnu/make/make-$MAKE_VERSION.tar.gz" "$archive" "$MAKE_SHA256"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building GNU make $MAKE_VERSION"
+download_and_extract_rootfs() {
+  local base archive sumfile expected actual version_file
+  base="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ALPINE_ARCH}"
+  archive="$CROSS_CACHE/alpine-minirootfs-${ALPINE_VERSION}-${ALPINE_ARCH}.tar.gz"
+  sumfile="$archive.sha256"
+  version_file="$CROSS_ROOT/etc/alpine-release"
 
-  # Keep configure under an explicit shell and capture its diagnostics.
-  # ChromeOS does not ship GNU make in this environment, so Automake cannot
-  # bootstrap its dependency-tracking fragments during configure.  Dependency
-  # tracking is unnecessary for this one-shot source build and is disabled.
-  local cfg_out="$work/configure-output.log"
-  if ! (
-    cd "$src"
-    CONFIG_SHELL=/bin/sh \
-    CC="$CC" CXX="$CXX" LD="$LD" AR="$AR" RANLIB="$RANLIB" NM="$NM" \
-    CFLAGS='-O2 -Wno-error' \
-      sh ./configure \
-        --prefix="$CROSS_PREFIX" \
-        --disable-nls \
-        --disable-dependency-tracking \
-        --disable-shared \
-        --enable-static
-  ) >"$cfg_out" 2>&1; then
-    warn "GNU make configure failed; diagnostic tail follows"
-    tail -n 120 "$cfg_out" >&2 2>/dev/null || true
-    if [[ -s "$src/config.log" ]]; then
-      printf '\n--- config.log (last 160 lines) ---\n' >&2
-      tail -n 160 "$src/config.log" >&2 || true
-      cp "$src/config.log" "$STATE/make-config.log" 2>/dev/null || true
+  if [[ -f "$version_file" && "$(cat "$version_file")" == "$ALPINE_VERSION" ]]; then
+    if [[ -f "$CROSS_COMPLETE" ]]; then
+      info "Alpine minirootfs $ALPINE_VERSION already installed"
+      return 0
     fi
-    die "GNU make configure failed (saved diagnostic: $STATE/make-config.log)"
+    warn "An incomplete Alpine setup was found; rebuilding the rootfs from the verified archive"
   fi
 
-  (
-    cd "$src"
-    CC="$CC" CFLAGS='-O2 -Wno-error' LDFLAGS='-static' sh ./build.sh
+  fetch "$base/${archive##*/}.sha256" "$sumfile"
+  fetch "$base/${archive##*/}" "$archive"
 
-    # build.sh has already produced the complete standalone GNU make binary.
-    # Do not run the generated top-level `make all`: that recurses into po/,
-    # whose Makefile is intentionally absent when NLS is disabled in this
-    # bootstrap-only environment.  Only the executable is needed downstream.
-    /usr/bin/install -c -m 0755 ./make "$BIN/make"
-    ln -sfn make "$BIN/gmake"
+  expected="$(awk 'NF {print $1; exit}' "$sumfile")"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid Alpine SHA-256 file"
+  actual="$(sha256_file "$archive")"
+  [[ "${actual,,}" == "${expected,,}" ]] || {
+    rm -f "$archive"
+    die "SHA-256 mismatch for ${archive##*/}"
+  }
 
-    "$BIN/make" --version >/dev/null
-    probe_dir="$work/probe"
-    mkdir -p "$probe_dir"
-    printf 'all:\n\t@printf "make-probe-ok\\n"\n' >"$probe_dir/Makefile"
-    [[ "$("$BIN/make" -s -C "$probe_dir")" == "make-probe-ok" ]]
-  )
-  mark_done make "$MAKE_VERSION"
+  info "Extracting Alpine minirootfs $ALPINE_VERSION"
+  rm -f "$CROSS_COMPLETE"
+  sudo rm -rf "$CROSS_ROOT"
+  sudo mkdir -p "$CROSS_ROOT"
+  sudo tar -xzf "$archive" -C "$CROSS_ROOT"
+  sudo chown root:root "$CROSS_ROOT"
 }
 
-install_bzip2() {
-  local archive="$CACHE/bzip2-$BZIP2_VERSION.tar.gz" work="$BUILD_ROOT/bzip2" src
-  if component_ready bzip2 "$BZIP2_VERSION" "$LIB/libbz2.a"; then
-    info "bzip2 $BZIP2_VERSION already installed"
-    return
-  fi
-  fetch "https://sourceware.org/pub/bzip2/bzip2-$BZIP2_VERSION.tar.gz" "$archive" "$BZIP2_SHA256"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building bzip2 $BZIP2_VERSION"
-  (
-    cd "$src"
-    # bzip2's default `all` target also runs its test suite, which requires
-    # the external `cmp` utility.  Minimal ChromeOS images may not provide it.
-    # Build only the artifacts required by the install target.
-    run_make libbz2.a bzip2 bzip2recover \
-      CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-      CFLAGS='-O2 -fPIC -Wall -Winline'
-    "$BIN/make" PREFIX="$CROSS_PREFIX" \
-      CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-      CFLAGS='-O2 -fPIC -Wall -Winline' install
-  )
-  mark_done bzip2 "$BZIP2_VERSION"
+configure_rootfs() {
+  info "Configuring Alpine repositories"
+
+  sudo mkdir -p "$CROSS_ROOT/etc/apk" "$CROSS_ROOT/etc/ssl/certs"
+  cat <<REPOS | sudo tee "$CROSS_ROOT/etc/apk/repositories" >/dev/null
+https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main
+https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community
+REPOS
+
+  sudo cp -f /etc/resolv.conf "$CROSS_ROOT/etc/resolv.conf"
+  [[ -f /etc/hosts ]] && sudo cp -f /etc/hosts "$CROSS_ROOT/etc/hosts" || true
+
+  mount_bind /dev "$CROSS_ROOT/dev" 1
+  mount_proc "$CROSS_ROOT/proc"
+  mount_bind /sys "$CROSS_ROOT/sys" 1
+  [[ -d /run ]] && mount_bind /run "$CROSS_ROOT/run" 1 || true
+
+  ensure_chroot_exec
+  ensure_apk_script_exec
 }
 
-install_pkgconf() {
-  local archive="$CACHE/pkgconf-$PKGCONF_VERSION.tar.xz" work="$BUILD_ROOT/pkgconf" src
-  if component_ready pkgconf "$PKGCONF_VERSION" "$BIN/pkgconf"; then
-    info "pkgconf $PKGCONF_VERSION already installed"
-    return
-  fi
-  fetch "https://distfiles.ariadne.space/pkgconf/pkgconf-$PKGCONF_VERSION.tar.xz" "$archive" "$PKGCONF_SHA256"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building pkgconf $PKGCONF_VERSION"
-  (
-    cd "$src"
-    CC="$CC" CFLAGS='-O2' LDFLAGS='-static' ./configure \
-      --prefix="$CROSS_PREFIX" --disable-shared --enable-static
-    run_make
-    "$BIN/make" install
-  )
-  ln -sfn pkgconf "$BIN/pkg-config"
-  mark_done pkgconf "$PKGCONF_VERSION"
+apk_chroot() {
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk "$@"
 }
 
-install_zlib() {
-  local archive="$CACHE/zlib-$ZLIB_VERSION.tar.gz" work="$BUILD_ROOT/zlib" src
-  if component_ready zlib "$ZLIB_VERSION" "$LIB/libz.a"; then
-    info "zlib $ZLIB_VERSION already installed"
-    return
-  fi
-  fetch "https://zlib.net/zlib-$ZLIB_VERSION.tar.gz" "$archive" "$ZLIB_SHA256"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building zlib $ZLIB_VERSION"
-  (
-    cd "$src"
-    CC="$CC" AR="$AR" RANLIB="$RANLIB" CFLAGS='-O2 -fPIC' \
-      ./configure --prefix="$CROSS_PREFIX" --static
-    run_make
-    "$BIN/make" install
-  )
-  mark_done zlib "$ZLIB_VERSION"
-}
+install_alpine_packages() {
+  info "Installing signed Alpine development packages"
 
-install_mbedtls() {
-  local base="mbedtls-$MBEDTLS_VERSION.tar.bz2"
-  local archive="$CACHE/$base"
-  local work="$BUILD_ROOT/mbedtls" src
-  if component_ready mbedtls "$MBEDTLS_VERSION" "$LIB/libmbedtls.a"; then
-    info "Mbed TLS $MBEDTLS_VERSION already installed"
-    return
-  fi
-  # The release page publishes the archive checksum in its release notes.
-  # A separate "-sha256sum.txt" asset is not guaranteed for every release.
-  fetch "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$MBEDTLS_VERSION/$base"     "$archive" "$MBEDTLS_SHA256"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building Mbed TLS $MBEDTLS_VERSION"
-  (
-    cd "$src"
-    # The upstream top-level install target depends on no_test -> programs ->
-    # mbedtls_test, which invokes Python.  Build only the three libraries and
-    # install their public headers/archive files directly.
-    run_make lib CC="$CC" AR="$AR" CFLAGS='-O2 -fPIC'
+  # A freshly extracted minirootfs does not need a whole-system upgrade here.
+  # `apk upgrade --available` can fail on ChromeOS chroots while processing the
+  # release image's initial world set, before any requested development package
+  # is installed. Refresh indexes, resolve the requested package set, then add
+  # that set directly. Dependencies are selected from the current signed indexes.
+  apk_chroot update
 
-    mkdir -p "$LIB" "$INCLUDE" "$LIB/pkgconfig"
-    rm -rf "$INCLUDE/mbedtls" "$INCLUDE/psa"
-    cp -R include/mbedtls "$INCLUDE/"
-    cp -R include/psa "$INCLUDE/"
-    install -m 0644 \
-      library/libmbedcrypto.a \
-      library/libmbedx509.a \
-      library/libmbedtls.a \
-      "$LIB/"
-
-    cat > "$LIB/pkgconfig/mbedcrypto.pc" <<EOF
-prefix=$CROSS_PREFIX
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: mbedcrypto
-Description: Mbed TLS cryptography library
-Version: $MBEDTLS_VERSION
-Libs: -L\${libdir} -lmbedcrypto
-Cflags: -I\${includedir}
-EOF
-
-    cat > "$LIB/pkgconfig/mbedx509.pc" <<EOF
-prefix=$CROSS_PREFIX
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: mbedx509
-Description: Mbed TLS X.509 library
-Version: $MBEDTLS_VERSION
-Requires.private: mbedcrypto
-Libs: -L\${libdir} -lmbedx509
-Cflags: -I\${includedir}
-EOF
-
-    cat > "$LIB/pkgconfig/mbedtls.pc" <<EOF
-prefix=$CROSS_PREFIX
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: mbedtls
-Description: Mbed TLS TLS library
-Version: $MBEDTLS_VERSION
-Requires.private: mbedx509 mbedcrypto
-Libs: -L\${libdir} -lmbedtls
-Cflags: -I\${includedir}
-EOF
+  local required=(
+    bash ca-certificates coreutils findutils diffutils grep sed gawk
+    tar gzip bzip2 xz file patch git git-init-template curl openssh-client
+    build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
+    openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
+    sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
+    rust cargo rustfmt rust-clippy rustup nodejs npm su-exec
   )
 
-  [[ -s "$LIB/libmbedtls.a" && -s "$LIB/libmbedx509.a" && -s "$LIB/libmbedcrypto.a" ]] || \
-    die "Mbed TLS libraries were not installed"
-  [[ -s "$INCLUDE/mbedtls/ssl.h" && -s "$INCLUDE/psa/crypto.h" ]] || \
-    die "Mbed TLS public headers were not installed"
-  mark_done mbedtls "$MBEDTLS_VERSION"
+  # A real apk transaction performs dependency resolution before applying any
+  # package changes. Avoid a separate --simulate gate: apk also reports existing
+  # database/filesystem health errors in simulation summaries, which can reject a
+  # perfectly resolvable package set without identifying a missing dependency.
+  info "Resolving and installing Alpine package set"
+  apk_chroot add --no-cache "${required[@]}"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/update-ca-certificates || true
+
+  # Alpine's rustup package installs the multicall binary as rustup-init.
+  # Expose it as rustup without downloading any upstream toolchain.
+  sudo mkdir -p "$CROSS_ROOT/usr/local/bin"
+  sudo ln -sfn /usr/bin/rustup-init "$CROSS_ROOT/usr/local/bin/rustup"
 }
 
-install_curl() {
-  local archive="$CACHE/curl-$CURL_VERSION.tar.gz" work="$BUILD_ROOT/curl" src
-  if component_ready curl "$CURL_VERSION" "$BIN/curl"; then
-    info "curl $CURL_VERSION already installed"
-    return
+configure_chronos_user() {
+  info "Configuring chronos identity inside Alpine"
+
+  local uid gid group
+  uid="$(id -u)"
+  gid="$(id -g)"
+
+  if sudo grep -q '^chronos:' "$CROSS_ROOT/etc/passwd"; then
+    return 0
   fi
-  fetch "https://curl.se/download/curl-$CURL_VERSION.tar.gz" "$archive" "$CURL_SHA256"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building curl $CURL_VERSION"
-  (
-    cd "$src"
-    PKG_CONFIG="$BIN/pkg-config" \
-    PKG_CONFIG_PATH="$LIB/pkgconfig:$CROSS_PREFIX/share/pkgconfig" \
-    CPPFLAGS="-I$INCLUDE" CFLAGS='-O2' LDFLAGS="-static -L$LIB" \
-    LIBS='-lpthread' CC="$CC" \
-      ./configure \
-        --prefix="$CROSS_PREFIX" \
-        --disable-shared --enable-static \
-        --with-mbedtls="$CROSS_PREFIX" --with-zlib="$CROSS_PREFIX" \
-        --with-ca-bundle="$CA_BUNDLE" \
-        --without-libpsl --without-libidn2 --without-brotli --without-zstd \
-        --without-libssh --without-libssh2 --without-librtmp --without-gssapi \
-        --without-nghttp2 --without-ngtcp2 --without-nghttp3 --without-quiche \
-        --disable-ldap --disable-ldaps --disable-rtsp --disable-dict \
-        --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
-        --disable-smb --disable-smtp --disable-gopher --disable-mqtt \
-        --disable-manual --disable-debug
-    run_make
-    "$BIN/make" install
-  )
-  mark_done curl "$CURL_VERSION"
-  hash -r
+
+  group="$(sudo awk -F: -v gid="$gid" '$3 == gid {print $1; exit}' "$CROSS_ROOT/etc/group")"
+  if [[ -z "$group" ]]; then
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/addgroup -g "$gid" chronos
+    group="chronos"
+  fi
+
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/adduser \
+    -D -u "$uid" -G "$group" -h "${HOME:-/home/chronos/user}" \
+    -s /bin/bash chronos
 }
 
-install_git() {
-  local archive="$CACHE/git-$GIT_VERSION.tar.xz" work="$BUILD_ROOT/git" src
-  if component_ready git "$GIT_VERSION" "$BIN/git"; then
-    info "Git $GIT_VERSION already installed"
-    return
-  fi
-  # kernel.org publishes signed release material. This script downloads over
-  # HTTPS; unlike the other fixed archives, Git's checksum is not hardcoded.
-  fetch "https://www.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz" "$archive"
-  extract_archive "$archive" "$work"
-  src="$(first_source_dir "$work")"
-  info "Building Git $GIT_VERSION"
-  (
-    cd "$src"
-    "$BIN/make" -j"$CROSS_JOBS" \
-      prefix="$CROSS_PREFIX" \
-      CC="$CC" AR="$AR" CURL_CONFIG="$BIN/curl-config" \
-      CURL_CFLAGS="$("$BIN/curl-config" --cflags)" \
-      CURL_LDFLAGS="$("$BIN/curl-config" --static-libs)" \
-      CFLAGS="-O2 -I$INCLUDE" LDFLAGS="-static -L$LIB" \
-      NO_OPENSSL=YesPlease NO_EXPAT=YesPlease NO_GETTEXT=YesPlease \
-      NO_PERL=YesPlease NO_PYTHON=YesPlease NO_TCLTK=YesPlease \
-      NO_ICONV=YesPlease NO_INSTALL_HARDLINKS=YesPlease \
-      all
-    "$BIN/make" \
-      prefix="$CROSS_PREFIX" \
-      CC="$CC" AR="$AR" CURL_CONFIG="$BIN/curl-config" \
-      CURL_CFLAGS="$("$BIN/curl-config" --cflags)" \
-      CURL_LDFLAGS="$("$BIN/curl-config" --static-libs)" \
-      CFLAGS="-O2 -I$INCLUDE" LDFLAGS="-static -L$LIB" \
-      NO_OPENSSL=YesPlease NO_EXPAT=YesPlease NO_GETTEXT=YesPlease \
-      NO_PERL=YesPlease NO_PYTHON=YesPlease NO_TCLTK=YesPlease \
-      NO_ICONV=YesPlease NO_INSTALL_HARDLINKS=YesPlease \
-      install
-  )
-  mark_done git "$GIT_VERSION"
+write_launcher() {
+  info "Writing cross launcher and command wrappers"
+
+  cat > "$CROSS_BIN/cross" <<'LAUNCHER'
+#!/bin/bash
+set -Eeuo pipefail
+
+ROOT="/usr/local/cross/alpine"
+HOST_HOME="${HOME:-/home/chronos/user}"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+if command -v chroot >/dev/null 2>&1; then
+  CHROOT_BIN="$(command -v chroot)"
+elif [[ -x /usr/sbin/chroot ]]; then
+  CHROOT_BIN="/usr/sbin/chroot"
+else
+  echo "cross: chroot command is unavailable" >&2
+  exit 1
+fi
+
+[[ -x "$ROOT/sbin/su-exec" ]] || {
+  echo "cross: Alpine environment is incomplete; rerun cross.sh" >&2
+  exit 1
 }
 
-install_rustup() {
-  local cargo_home="$OPT/cargo" rustup_home="$OPT/rustup"
-  local init="$CACHE/rustup-init-$RUST_HOST" sum="$CACHE/rustup-init-$RUST_HOST.sha256"
-  local expected
-  if [[ -x "$cargo_home/bin/rustup" ]]; then
-    info "rustup already installed"
-  else
-    fetch "https://static.rust-lang.org/rustup/dist/$RUST_HOST/rustup-init" "$init"
-    fetch "https://static.rust-lang.org/rustup/dist/$RUST_HOST/rustup-init.sha256" "$sum"
-    expected="$(awk '{print $1; exit}' "$sum")"
-    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid rustup checksum sidecar"
-    verify_sha256 "$init" "${expected,,}"
-    chmod 0755 "$init"
-    info "Installing rustup ($CROSS_RUST_TOOLCHAIN, minimal profile)"
-    CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" \
-      "$init" -y --no-modify-path --profile minimal \
-      --default-toolchain "$CROSS_RUST_TOOLCHAIN"
-  fi
-
-  export CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home"
-  export PATH="$CARGO_HOME/bin:$BIN:$PATH"
-  "$CARGO_HOME/bin/rustup" toolchain install "$CROSS_RUST_TOOLCHAIN" --profile minimal
-  "$CARGO_HOME/bin/rustup" default "$CROSS_RUST_TOOLCHAIN"
-  "$CARGO_HOME/bin/rustup" component add rustfmt clippy || warn "rustfmt/clippy are unavailable for this toolchain"
+is_mounted() {
+  awk -v target="$1" '$2 == target { found=1 } END { exit !found }' /proc/mounts
 }
 
-install_nvm() {
-  local archive="$CACHE/nvm-$NVM_VERSION.tar.gz" work="$BUILD_ROOT/nvm" src nvm_dir="$OPT/nvm"
-  if [[ -s "$nvm_dir/nvm.sh" && -f "$STATE/nvm.version" && "$(cat "$STATE/nvm.version")" == "$NVM_VERSION" ]]; then
-    info "nvm $NVM_VERSION already installed"
-  else
-    fetch "https://github.com/nvm-sh/nvm/archive/refs/tags/$NVM_VERSION.tar.gz" "$archive"
-    extract_archive "$archive" "$work"
-    src="$(first_source_dir "$work")"
-    rm -rf "$nvm_dir"
-    mkdir -p "$nvm_dir"
-    cp -a "$src"/. "$nvm_dir"/
-    mark_done nvm "$NVM_VERSION"
-  fi
-
-  export NVM_DIR="$nvm_dir"
-  set +u
-  # shellcheck source=/dev/null
-  . "$NVM_DIR/nvm.sh"
-  set -u
-
-  if [[ "$CROSS_INSTALL_NODE" == 1 ]]; then
-    info "Installing Node.js via nvm: $CROSS_NODE_VERSION"
-    set +u
-    if [[ "$CROSS_NODE_VERSION" == 'lts/*' || "$CROSS_NODE_VERSION" == lts ]]; then
-      nvm install --lts
-      nvm alias default 'lts/*'
+mount_bind() {
+  local source="$1" target="$2" recursive="${3:-0}"
+  sudo mkdir -p "$target"
+  if ! is_mounted "$target"; then
+    if [[ "$recursive" == 1 ]]; then
+      sudo mount --rbind "$source" "$target"
+      sudo mount --make-rslave "$target" 2>/dev/null || true
     else
-      nvm install "$CROSS_NODE_VERSION"
-      nvm alias default "$CROSS_NODE_VERSION"
+      sudo mount --bind "$source" "$target"
     fi
-    nvm use default
-    set -u
   fi
+}
+
+mount_proc() {
+  local target="$1"
+  sudo mkdir -p "$target"
+  if ! is_mounted "$target"; then
+    sudo mount -t proc proc "$target"
+  fi
+}
+
+ensure_apk_script_exec() {
+  local execdir="$ROOT/lib/apk/exec"
+  local probe="$execdir/.cross-exec-probe"
+  local marker="$ROOT/etc/.cross-bin-sh-hardlink"
+
+  relink_busybox_sh() {
+    if [[ -L "$ROOT/bin/sh" ]] || [[ ! -e "$ROOT/bin/sh" ]] || \
+       [[ "$(sudo stat -c '%d:%i' "$ROOT/bin/sh" 2>/dev/null || true)" != \
+          "$(sudo stat -c '%d:%i' "$ROOT/bin/busybox")" ]]; then
+      sudo rm -f "$ROOT/bin/sh"
+      sudo ln "$ROOT/bin/busybox" "$ROOT/bin/sh" || {
+        echo "cross: cannot hard-link Alpine /bin/sh to BusyBox" >&2
+        exit 1
+      }
+    fi
+    sudo chmod 0755 "$ROOT/bin/busybox" "$ROOT/bin/sh"
+  }
+
+  [[ -f "$marker" ]] && relink_busybox_sh
+
+  sudo mkdir -p "$execdir"
+  printf '%s\n' '#!/bin/sh' 'exit 0' | sudo tee "$probe" >/dev/null
+  sudo chmod 0755 "$probe"
+  if sudo "$CHROOT_BIN" "$ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
+    sudo rm -f "$probe"
+    return 0
+  fi
+
+  relink_busybox_sh
+  sudo touch "$marker"
+  if ! sudo "$CHROOT_BIN" "$ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
+    sudo rm -f "$probe"
+    echo "cross: ChromeOS still denies Alpine package scripts" >&2
+    exit 1
+  fi
+  sudo rm -f "$probe"
+}
+
+ensure_chroot_exec() {
+  local security_mnt="/sys/kernel/security"
+  local policy_file="$security_mnt/chromiumos/inode_security_policies/allow_symlink"
+  local mounted_here=0 remounted_rw=0 security_opts=""
+
+  if sudo "$CHROOT_BIN" "$ROOT" /bin/busybox true >/dev/null 2>&1; then
+    return 0
+  fi
+
+  sudo mkdir -p "$security_mnt"
+  if ! awk -v target="$security_mnt" '$2 == target { found=1 } END { exit !found }' /proc/mounts; then
+    sudo mount -t securityfs -o nodev,noexec,nosuid securityfs "$security_mnt" || {
+      echo "cross: cannot mount ChromeOS securityfs" >&2
+      exit 1
+    }
+    mounted_here=1
+  fi
+
+  security_opts="$(awk -v target="$security_mnt" '$2 == target { print $4; exit }' /proc/mounts)"
+  if [[ ",${security_opts}," == *,ro,* ]]; then
+    sudo mount -o remount,rw "$security_mnt" || {
+      echo "cross: cannot remount ChromeOS securityfs read-write" >&2
+      exit 1
+    }
+    remounted_rw=1
+  fi
+
+  [[ -e "$policy_file" ]] || {
+    echo "cross: ChromeOS allow_symlink policy interface is unavailable" >&2
+    exit 1
+  }
+
+  printf '%s' '/mnt/stateful_partition/dev_image' | sudo tee "$policy_file" >/dev/null
+  if ! sudo "$CHROOT_BIN" "$ROOT" /bin/busybox true >/dev/null 2>&1; then
+    printf '%s' '/mnt/stateful_partition' | sudo tee "$policy_file" >/dev/null
+  fi
+
+  if (( remounted_rw )); then
+    sudo mount -o remount,ro "$security_mnt" >/dev/null 2>&1 || true
+  fi
+  if (( mounted_here )); then
+    sudo umount "$security_mnt" >/dev/null 2>&1 || true
+  fi
+
+  sudo "$CHROOT_BIN" "$ROOT" /bin/busybox true >/dev/null 2>&1 || {
+    echo "cross: ChromeOS still denies execution inside the Alpine rootfs" >&2
+    exit 1
+  }
+}
+
+sudo cp -f /etc/resolv.conf "$ROOT/etc/resolv.conf"
+[[ -f /etc/hosts ]] && sudo cp -f /etc/hosts "$ROOT/etc/hosts" || true
+
+mount_bind /dev "$ROOT/dev" 1
+mount_proc "$ROOT/proc"
+mount_bind /sys "$ROOT/sys" 1
+[[ -d /run ]] && mount_bind /run "$ROOT/run" 1 || true
+mount_bind "$HOST_HOME" "$ROOT$HOST_HOME" 0
+ensure_chroot_exec
+ensure_apk_script_exec
+
+case "$PWD" in
+  "$HOST_HOME"|"$HOST_HOME"/*) CROSS_CWD="$PWD" ;;
+  *) CROSS_CWD="$HOST_HOME" ;;
+esac
+
+if (( $# == 0 )); then
+  set -- /bin/bash -l
+fi
+
+exec sudo "$CHROOT_BIN" "$ROOT" /usr/bin/env -i \
+  HOME="$HOST_HOME" \
+  USER=chronos \
+  LOGNAME=chronos \
+  SHELL=/bin/bash \
+  TERM="${TERM:-linux}" \
+  LANG="${LANG:-C.UTF-8}" \
+  LC_ALL="${LC_ALL:-}" \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+  GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+  RUSTUP_HOME="$HOST_HOME/.rustup" \
+  CARGO_HOME="$HOST_HOME/.cargo" \
+  /sbin/su-exec "$HOST_UID:$HOST_GID" \
+  /bin/sh -c 'cd "$1"; shift; exec "$@"' sh "$CROSS_CWD" "$@"
+LAUNCHER
+  chmod 0755 "$CROSS_BIN/cross"
+
+  local cmd
+  for cmd in \
+    apk bash sh git git-upload-pack git-receive-pack curl wget ssh scp \
+    cc c++ gcc g++ cpp ar as ld nm objdump ranlib strip make cmake ninja meson \
+    pkg-config autoconf autoheader automake aclocal libtoolize m4 \
+    rustup rustc cargo rustfmt clippy-driver \
+    node npm npx corepack python3; do
+    cat > "$CROSS_BIN/$cmd" <<WRAPPER
+#!/bin/sh
+exec "$CROSS_BIN/cross" "$cmd" "\$@"
+WRAPPER
+    chmod 0755 "$CROSS_BIN/$cmd"
+  done
+
+  cat > "$CROSS_BIN/nvm" <<'NVM_NOTICE'
+#!/bin/sh
+echo "nvm is not packaged by Alpine. This strict Alpine-only environment provides node and npm from apk." >&2
+echo "Use: apk upgrade nodejs npm" >&2
+exit 2
+NVM_NOTICE
+  chmod 0755 "$CROSS_BIN/nvm"
 }
 
 write_profile() {
-  local profile="$ETC/cross-env.sh" bashrc="$HOME/.bashrc" bash_profile="$HOME/.bash_profile"
-  local begin='# >>> cross.sh minimal environment >>>' end='# <<< cross.sh minimal environment <<<' tmp
+  info "Updating shell profile"
 
-  cat > "$profile" <<PROFILE
-# Generated by cross.sh
-export CROSS_PREFIX="$CROSS_PREFIX"
-export PATH="$OPT/cargo/bin:$BIN:\$PATH"
-export CC="$BIN/cc"
-export CXX="$BIN/c++"
-export AR="$BIN/ar"
-export RANLIB="$BIN/ranlib"
-export NM="$BIN/nm"
-export PKG_CONFIG="$BIN/pkg-config"
-export PKG_CONFIG_PATH="$LIB/pkgconfig:$CROSS_PREFIX/share/pkgconfig"
-export CARGO_HOME="$OPT/cargo"
-export RUSTUP_HOME="$OPT/rustup"
-export NVM_DIR="$OPT/nvm"
-if [ -s "\$NVM_DIR/nvm.sh" ]; then
-  case \$- in *u*) _cross_had_nounset=1; set +u ;; *) _cross_had_nounset=0 ;; esac
-  . "\$NVM_DIR/nvm.sh"
-  [ "\$_cross_had_nounset" = 1 ] && set -u
-  unset _cross_had_nounset
-fi
+  local bashrc="${HOME:-/home/chronos/user}/.bashrc"
+  local profile="${HOME:-/home/chronos/user}/.bash_profile"
+  local begin='# >>> cross-alpine >>>'
+
+  touch "$bashrc" "$profile"
+  if ! grep -Fq "$begin" "$bashrc"; then
+    cat >> "$bashrc" <<'PROFILE'
+
+# >>> cross-alpine >>>
+export PATH="/usr/local/cross/bin:$PATH"
+# <<< cross-alpine <<<
 PROFILE
-  chmod 0644 "$profile"
+  fi
+  if ! grep -Fq "$begin" "$profile"; then
+    cat >> "$profile" <<'PROFILE'
 
-  touch "$bashrc"
-  tmp="$BUILD_ROOT/bashrc"
-  awk -v b="$begin" -v e="$end" '
-    $0 == b {skip=1; next}
-    $0 == e {skip=0; next}
-    !skip {print}
-  ' "$bashrc" > "$tmp"
-  cat >> "$tmp" <<PROFILE
-
-$begin
-[ -r "$profile" ] && . "$profile"
-$end
-PROFILE
-  cp -p "$bashrc" "$bashrc.cross-backup" 2>/dev/null || true
-  cat "$tmp" > "$bashrc"
-
-  touch "$bash_profile"
-  if ! grep -Eq '(^|[[:space:]])(source|\.)[[:space:]]+.*\.bashrc' "$bash_profile"; then
-    cat >> "$bash_profile" <<'PROFILE'
-
-# Added by cross.sh
-[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+# >>> cross-alpine >>>
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+# <<< cross-alpine <<<
 PROFILE
   fi
 }
 
-self_test() {
-  local testdir="$BUILD_ROOT/self-test"
+validate() {
+  info "Validating Alpine package environment"
+
+  ensure_apk_script_exec
+  "$CROSS_BIN/cross" git --version
+  "$CROSS_BIN/cross" curl --version | head -n1
+  "$CROSS_BIN/cross" gcc --version | head -n1
+  "$CROSS_BIN/cross" make --version | head -n1
+  "$CROSS_BIN/cross" rustup --version
+  "$CROSS_BIN/cross" rustc --version
+  "$CROSS_BIN/cross" cargo --version
+  "$CROSS_BIN/cross" node --version
+  "$CROSS_BIN/cross" npm --version
+
+  local testdir
+  testdir="${HOME:-/home/chronos/user}/.cross-smoke-test.$$"
   mkdir -p "$testdir"
-  info "Running smoke tests"
-
-  cat > "$testdir/hello.c" <<'C'
+  cat > "$testdir/hello.c" <<'C_SOURCE'
 #include <stdio.h>
-#include <zlib.h>
-int main(void) {
-  printf("musl C toolchain OK; zlib %s\n", zlibVersion());
-  return 0;
-}
-C
-  "$CC" -static -I"$INCLUDE" "$testdir/hello.c" "$LIB/libz.a" -o "$testdir/hello"
-  "$testdir/hello"
-
-  "$BIN/curl" --version | head -n2
-  "$BIN/git" --version
-  "$OPT/cargo/bin/rustc" --version
-  "$OPT/cargo/bin/cargo" --version
-
-  export NVM_DIR="$OPT/nvm"
-  set +u
-  # shellcheck source=/dev/null
-  . "$NVM_DIR/nvm.sh"
-  nvm --version
-  if [[ "$CROSS_INSTALL_NODE" == 1 ]]; then
-    node --version
-    npm --version
-    node -e 'console.log("Node.js OK")'
-  fi
-  set -u
+int main(void) { puts("cross-alpine-ok"); return 0; }
+C_SOURCE
+  "$CROSS_BIN/cross" /bin/sh -c "cd '$testdir' && cc hello.c -o hello && ./hello"
+  rm -rf "$testdir"
 }
 
 main() {
-  info "cross.sh $SCRIPT_VERSION"
   preflight
-  prepare_prefix
-  install_zig
-  install_make
-  install_bzip2
-  install_pkgconf
-  install_zlib
-  install_mbedtls
-  install_curl
-  install_git
-  install_rustup
-  install_nvm
+  reset_or_prepare_prefix
+  download_and_extract_rootfs
+  configure_rootfs
+  install_alpine_packages
+  configure_chronos_user
+  write_launcher
   write_profile
-  self_test
+  validate
+  printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_COMPLETE"
 
-  info "Done"
-  cat <<RESULT
-Installed prefix: $CROSS_PREFIX
-Log:              $LOG_FILE
+  info "Setup complete"
+  cat <<SUMMARY
 
-Activate it in the current shell with:
-  source "$ETC/cross-env.sh"
+No source packages were built.
+All installed system tools and libraries came from signed Alpine ${ALPINE_BRANCH}
+main/community packages.
 
-No ChromeOS rootfs files were replaced. C/C++ output from cc/c++ is static musl;
-Rust and Node host tools use the ChromeOS host ABI and are kept under /usr/local
-so they remain executable even when the user-data mount is noexec.
-RESULT
+Activate wrappers in the current shell:
+  source ~/.bashrc
+
+Examples:
+  git --version
+  cc --version
+  node --version
+  rustup --version
+  cross                 # interactive Alpine-backed shell
+  cross apk upgrade     # update all Alpine packages
+
+Note: Alpine does not package nvm. Node.js and npm are supplied directly by apk.
+Log: $LOG_FILE
+SUMMARY
 }
 
 main "$@"

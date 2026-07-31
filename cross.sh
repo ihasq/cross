@@ -32,7 +32,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-07-31.24-apk-v2-script-runner"
+SCRIPT_VERSION="2026-07-31.25-resume-safe-validation"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -154,23 +154,32 @@ ensure_file_backed_package_scripts() {
 
 bootstrap_apk_v2_runner() {
   local compat_repositories="$CROSS_ROOT/etc/apk/repositories.apk2"
-  local version
+  local version=""
 
-  info "Installing Alpine apk-tools v2 compatibility runner"
-  cat <<REPOS | sudo tee "$compat_repositories" >/dev/null
+  if [[ -x "$CROSS_ROOT/sbin/apk.static" ]]; then
+    version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
+  fi
+
+  if [[ "$version" != apk-tools\ 2.* ]]; then
+    info "Installing Alpine apk-tools v2 compatibility runner"
+    cat <<REPOS | sudo tee "$compat_repositories" >/dev/null
 https://dl-cdn.alpinelinux.org/alpine/${APK_COMPAT_BRANCH}/main
 REPOS
 
-  # Use the minirootfs' apk v3 only for this script-free bootstrap transaction.
-  # The repository file contains only Alpine v3.22, whose apk-tools-static is
-  # the final apk-tools v2 release line. No package hook is executed here.
-  sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
-    --repositories-file /etc/apk/repositories.apk2 \
-    --scripts=no --commit-hooks=no add --no-cache apk-tools-static
+    # Use the minirootfs' apk v3 only for this script-free bootstrap transaction.
+    # The repository file contains only Alpine v3.22, whose apk-tools-static is
+    # the final apk-tools v2 release line. No package hook is executed here.
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
+      --repositories-file /etc/apk/repositories.apk2 \
+      --scripts=no --commit-hooks=no add --no-cache apk-tools-static
 
-  [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
-    || die "Alpine apk-tools v2 static binary was not installed"
-  version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | head -n1)"
+    [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
+      || die "Alpine apk-tools v2 static binary was not installed"
+    version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
+  else
+    info "Using existing Alpine apk-tools v2 compatibility runner"
+  fi
+
   [[ "$version" == apk-tools\ 2.* ]] \
     || die "unexpected compatibility apk version: $version"
   printf 'Compatibility apk: %s\n' "$version"
@@ -312,6 +321,19 @@ reset_or_prepare_prefix() {
   printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_MARKER"
 }
 
+rootfs_is_resumable() {
+  [[ -f "$CROSS_ROOT/lib/apk/db/installed" ]] \
+    && [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/git" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/gcc" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/make" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/rustc" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/cargo" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/node" ]] \
+    && [[ -x "$CROSS_ROOT/usr/bin/npm" ]] \
+    && [[ -x "$CROSS_ROOT/sbin/su-exec" ]]
+}
+
 download_and_extract_rootfs() {
   local base archive sumfile expected actual version_file
   base="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ALPINE_ARCH}"
@@ -322,6 +344,10 @@ download_and_extract_rootfs() {
   if [[ -f "$version_file" && "$(cat "$version_file")" == "$ALPINE_VERSION" ]]; then
     if [[ -f "$CROSS_COMPLETE" ]]; then
       info "Alpine minirootfs $ALPINE_VERSION already installed"
+      return 0
+    fi
+    if rootfs_is_resumable; then
+      warn "A fully populated but unvalidated Alpine setup was found; resuming without re-extraction"
       return 0
     fi
     warn "An incomplete Alpine setup was found; rebuilding the rootfs from the verified archive"
@@ -408,9 +434,14 @@ install_alpine_packages() {
 configure_chronos_user() {
   info "Configuring chronos identity inside Alpine"
 
-  local uid gid group
+  local uid gid group host_home
   uid="$(id -u)"
   gid="$(id -g)"
+  host_home="${HOME:-/home/chronos/user}"
+
+  # adduser expects the parent path to exist even though the real ChromeOS home
+  # is bind-mounted over this directory by the launcher.
+  sudo mkdir -p "$CROSS_ROOT$host_home"
 
   if sudo grep -q '^chronos:' "$CROSS_ROOT/etc/passwd"; then
     return 0
@@ -423,7 +454,7 @@ configure_chronos_user() {
   fi
 
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/adduser \
-    -D -u "$uid" -G "$group" -h "${HOME:-/home/chronos/user}" \
+    -D -u "$uid" -G "$group" -h "$host_home" \
     -s /bin/bash chronos
 }
 
@@ -486,7 +517,7 @@ ensure_apk_compat() {
     echo "cross: Alpine apk-tools v2 compatibility runner is missing; rerun cross.sh" >&2
     exit 1
   }
-  version="$(sudo "$CHROOT_BIN" "$ROOT" /sbin/apk.static --version 2>&1 | head -n1)"
+  version="$(sudo "$CHROOT_BIN" "$ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
   case "$version" in
     apk-tools\ 2.*) ;;
     *) echo "cross: unexpected compatibility apk version: $version" >&2; exit 1 ;;
@@ -645,9 +676,11 @@ validate() {
   ensure_file_backed_package_scripts
   "$CROSS_BIN/cross" apk --version
   "$CROSS_BIN/cross" git --version
-  "$CROSS_BIN/cross" curl --version | head -n1
-  "$CROSS_BIN/cross" gcc --version | head -n1
-  "$CROSS_BIN/cross" make --version | head -n1
+  # sed consumes the complete stream. Unlike head -n1, it does not close the
+  # pipe early and turn a successful producer into SIGPIPE under pipefail.
+  "$CROSS_BIN/cross" curl --version | sed -n '1p'
+  "$CROSS_BIN/cross" gcc --version | sed -n '1p'
+  "$CROSS_BIN/cross" make --version | sed -n '1p'
   "$CROSS_BIN/cross" rustup --version
   "$CROSS_BIN/cross" rustc --version
   "$CROSS_BIN/cross" cargo --version

@@ -4,12 +4,15 @@
 # This version performs NO source builds. It installs an official Alpine Linux
 # minirootfs and signed Alpine packages below /usr/local/cross/alpine, then
 # exposes convenient host-side wrappers such as `git`, `cc`, `make`, `rustup`,
-# `node`, and `npm` through a plain chroot launcher.
+# `node`, and `npm` through a localhost-only OpenSSH service hosted by a VT-2
+# process. The crosh-side `cross` command is an actual SSH client.
 #
 # Runtime characteristics:
 #   * same ChromeOS kernel; no VM, no LXC/Docker, no namespaces
 #   * a chroot is used only to give Alpine binaries their expected /lib and /usr
 #   * the ChromeOS home directory is bind-mounted at the identical path
+#   * a VT-2-started sshd listens only on 127.0.0.1 and uses a dedicated key
+#   * build outputs intended for execution belong under /usr/local/cross/work
 #   * all compiler/runtime/library files are obtained from Alpine repositories
 #   * apk-tools v2 static from Alpine v3.22 is retained only as the package-
 #     transaction runner because ChromeOS rejects apk-tools v3 executable memfd
@@ -32,7 +35,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-07-31.25-resume-safe-validation"
+SCRIPT_VERSION="2026-07-31.27-ssh-auth-readable-keys"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -40,6 +43,11 @@ CROSS_PREFIX="${CROSS_PREFIX:-/usr/local/cross}"
 CROSS_ROOT="$CROSS_PREFIX/alpine"
 CROSS_BIN="$CROSS_PREFIX/bin"
 CROSS_CACHE="$CROSS_PREFIX/cache"
+CROSS_ETC="$CROSS_PREFIX/etc"
+CROSS_RUN="$CROSS_PREFIX/run"
+CROSS_LOG="$CROSS_PREFIX/log"
+CROSS_WORK="$CROSS_PREFIX/work"
+CROSS_SSH_PORT="${CROSS_SSH_PORT:-32222}"
 CROSS_MARKER="$CROSS_PREFIX/.alpine-cross-managed"
 CROSS_COMPLETE="$CROSS_PREFIX/.alpine-cross-complete"
 LOG_FILE="${HOME:-/home/chronos/user}/cross-setup-$(date +%Y%m%d-%H%M%S).log"
@@ -48,6 +56,7 @@ HOST_ARCH=""
 ALPINE_ARCH=""
 FETCH_TOOL=""
 CHROOT_BIN=""
+HOST_SSH_BIN=""
 ROOTFS_MOUNTED=()
 
 if command -v tee >/dev/null 2>&1; then
@@ -59,12 +68,18 @@ warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-cleanup() {
-  local status=$? i target
+release_setup_mounts() {
+  local i target
   for ((i=${#ROOTFS_MOUNTED[@]}-1; i>=0; i--)); do
     target="${ROOTFS_MOUNTED[$i]}"
     sudo umount -l "$target" >/dev/null 2>&1 || true
   done
+  ROOTFS_MOUNTED=()
+}
+
+cleanup() {
+  local status=$?
+  release_setup_mounts
   if (( status != 0 )); then
     printf '\nSetup failed. Log: %s\n' "$LOG_FILE" >&2
   fi
@@ -269,6 +284,24 @@ preflight() {
     die "chroot is required"
   fi
 
+  local candidate
+  for candidate in /usr/bin/ssh /bin/ssh /usr/local/bin/ssh; do
+    if [[ -x "$candidate" && "$candidate" != "$CROSS_BIN/ssh" ]]; then
+      HOST_SSH_BIN="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$HOST_SSH_BIN" ]]; then
+    candidate="$(PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin command -v ssh 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" && "$candidate" != "$CROSS_BIN/ssh" ]]; then
+      HOST_SSH_BIN="$candidate"
+    fi
+  fi
+  [[ -n "$HOST_SSH_BIN" ]] \
+    || die "a host OpenSSH client is required for the crosh-side cross command"
+  "$HOST_SSH_BIN" -V >/dev/null 2>&1 \
+    || die "the detected host ssh client is not usable: $HOST_SSH_BIN"
+
   local nnp opts free_kib
   nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
   [[ "$nnp" != 1 ]] || die "NoNewPrivs is active; run from VT-2, not browser crosh"
@@ -290,6 +323,11 @@ preflight() {
     *) die "unsupported architecture: $HOST_ARCH" ;;
   esac
 
+  [[ "$CROSS_PREFIX" != *[[:space:]]* ]] \
+    || die "CROSS_PREFIX must not contain whitespace"
+  [[ "$CROSS_SSH_PORT" =~ ^[0-9]+$ ]] && (( CROSS_SSH_PORT >= 1024 && CROSS_SSH_PORT <= 65535 )) \
+    || die "CROSS_SSH_PORT must be an unprivileged TCP port from 1024 to 65535"
+
   opts="$(awk '$2 == "/usr/local" {print $4}' /proc/mounts | tail -n1)"
   [[ ",${opts}," != *,noexec,* ]] || die "/usr/local is mounted noexec"
 
@@ -300,6 +338,8 @@ preflight() {
   printf 'Architecture: %s\n' "$ALPINE_ARCH"
   printf 'Alpine:       %s\n' "$ALPINE_VERSION"
   printf 'Prefix:       %s\n' "$CROSS_PREFIX"
+  printf 'Host SSH:     %s\n' "$HOST_SSH_BIN"
+  printf 'SSH port:     %s\n' "$CROSS_SSH_PORT"
 }
 
 reset_or_prepare_prefix() {
@@ -316,9 +356,18 @@ reset_or_prepare_prefix() {
     fi
   fi
 
-  sudo mkdir -p "$CROSS_PREFIX" "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_CACHE"
-  sudo chown "$(id -u):$(id -g)" "$CROSS_PREFIX" "$CROSS_BIN" "$CROSS_CACHE"
+  sudo mkdir -p "$CROSS_PREFIX" "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_CACHE" \
+    "$CROSS_ETC" "$CROSS_RUN" "$CROSS_LOG" "$CROSS_WORK"
+  sudo chown "$(id -u):$(id -g)" "$CROSS_PREFIX" "$CROSS_BIN" "$CROSS_CACHE" \
+    "$CROSS_RUN" "$CROSS_LOG" "$CROSS_WORK"
   printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_MARKER"
+}
+
+quiesce_existing_service() {
+  if [[ -x "$CROSS_BIN/cross-service" && -r "$CROSS_ETC/cross.conf" ]]; then
+    info "Stopping existing cross service for maintenance"
+    "$CROSS_BIN/cross-service" stop
+  fi
 }
 
 rootfs_is_resumable() {
@@ -410,7 +459,7 @@ install_alpine_packages() {
 
   local required=(
     bash ca-certificates coreutils findutils diffutils grep sed gawk
-    tar gzip bzip2 xz file patch git git-init-template curl openssh-client
+    tar gzip bzip2 xz file patch git git-init-template curl openssh-client openssh-server
     build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
@@ -434,54 +483,251 @@ install_alpine_packages() {
 configure_chronos_user() {
   info "Configuring chronos identity inside Alpine"
 
-  local uid gid group host_home
+  local uid gid group host_home shadow_tmp
   uid="$(id -u)"
   gid="$(id -g)"
   host_home="${HOME:-/home/chronos/user}"
 
-  # adduser expects the parent path to exist even though the real ChromeOS home
-  # is bind-mounted over this directory by the launcher.
   sudo mkdir -p "$CROSS_ROOT$host_home"
 
-  if sudo grep -q '^chronos:' "$CROSS_ROOT/etc/passwd"; then
-    return 0
+  if ! sudo grep -q '^chronos:' "$CROSS_ROOT/etc/passwd"; then
+    group="$(sudo awk -F: -v gid="$gid" '$3 == gid {print $1; exit}' "$CROSS_ROOT/etc/group")"
+    if [[ -z "$group" ]]; then
+      sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/addgroup -g "$gid" chronos
+      group="chronos"
+    fi
+
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/adduser \
+      -D -u "$uid" -G "$group" -h "$host_home" \
+      -s /bin/bash chronos
   fi
 
-  group="$(sudo awk -F: -v gid="$gid" '$3 == gid {print $1; exit}' "$CROSS_ROOT/etc/group")"
-  if [[ -z "$group" ]]; then
-    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/addgroup -g "$gid" chronos
-    group="chronos"
-  fi
-
-  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/adduser \
-    -D -u "$uid" -G "$group" -h "$host_home" \
-    -s /bin/bash chronos
+  # OpenSSH with UsePAM=no rejects accounts whose shadow password begins with
+  # '!' or '*', even when only public-key authentication is enabled. Install an
+  # impossible non-locking password field; password authentication remains off.
+  shadow_tmp="$(mktemp)"
+  sudo awk -F: 'BEGIN { OFS=FS } $1 == "chronos" { $2="x" } { print }' \
+    "$CROSS_ROOT/etc/shadow" > "$shadow_tmp"
+  sudo install -o root -g root -m 0600 "$shadow_tmp" "$CROSS_ROOT/etc/shadow"
+  rm -f "$shadow_tmp"
 }
 
-write_launcher() {
-  info "Writing cross launcher and command wrappers"
+write_ssh_service() {
+  info "Writing localhost OpenSSH service and crosh client"
 
-  cat > "$CROSS_BIN/cross" <<'LAUNCHER'
+  local uid gid host_home ssh_dir client_key client_pub server_pub
+  uid="$(id -u)"
+  gid="$(id -g)"
+  host_home="${HOME:-/home/chronos/user}"
+  ssh_dir="$CROSS_ETC/ssh"
+  client_key="$ssh_dir/cross_client_ed25519"
+  client_pub="$client_key.pub"
+
+  sudo mkdir -p "$ssh_dir" "$CROSS_ROOT/etc/ssh" "$CROSS_ROOT/usr/local/libexec" \
+    "$CROSS_ROOT/run" "$CROSS_ROOT/var/log" "$CROSS_WORK/chronos"
+  sudo chown "$uid:$gid" "$ssh_dir" "$CROSS_WORK/chronos"
+  sudo chmod 0700 "$ssh_dir"
+
+  if [[ ! -s "$CROSS_ROOT/etc/ssh/ssh_host_ed25519_key" ]]; then
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/ssh-keygen \
+      -q -t ed25519 -N '' -C cross-local-host \
+      -f /etc/ssh/ssh_host_ed25519_key
+  fi
+  sudo chmod 0600 "$CROSS_ROOT/etc/ssh/ssh_host_ed25519_key"
+  sudo chmod 0644 "$CROSS_ROOT/etc/ssh/ssh_host_ed25519_key.pub"
+
+  if [[ ! -s "$client_key" || ! -s "$client_pub" ]]; then
+    sudo rm -f "$CROSS_ROOT/etc/ssh/.cross-client-key" \
+      "$CROSS_ROOT/etc/ssh/.cross-client-key.pub"
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/ssh-keygen \
+      -q -t ed25519 -N '' -C cross-local-client \
+      -f /etc/ssh/.cross-client-key
+    sudo cp -f "$CROSS_ROOT/etc/ssh/.cross-client-key" "$client_key"
+    sudo cp -f "$CROSS_ROOT/etc/ssh/.cross-client-key.pub" "$client_pub"
+    sudo rm -f "$CROSS_ROOT/etc/ssh/.cross-client-key" \
+      "$CROSS_ROOT/etc/ssh/.cross-client-key.pub"
+  fi
+  sudo chown "$uid:$gid" "$client_key" "$client_pub"
+  sudo chmod 0600 "$client_key"
+  sudo chmod 0644 "$client_pub"
+
+  awk '{print $1, $2}' "$client_pub" | sudo tee \
+    "$CROSS_ROOT/etc/ssh/cross_authorized_keys" >/dev/null
+  # OpenSSH opens AuthorizedKeysFile after temporarily switching to the
+  # target user's uid. Keep this central file root-owned so chronos cannot
+  # modify it, but make it readable by the authenticating user.
+  sudo chown root:root "$CROSS_ROOT/etc/ssh/cross_authorized_keys"
+  sudo chmod 0644 "$CROSS_ROOT/etc/ssh/cross_authorized_keys"
+
+  cat <<SESSION | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-session" >/dev/null
 #!/bin/bash
 set -Eeuo pipefail
 
-ROOT="/usr/local/cross/alpine"
-HOST_HOME="${HOME:-/home/chronos/user}"
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
-if command -v chroot >/dev/null 2>&1; then
-  CHROOT_BIN="$(command -v chroot)"
-elif [[ -x /usr/sbin/chroot ]]; then
-  CHROOT_BIN="/usr/sbin/chroot"
-else
-  echo "cross: chroot command is unavailable" >&2
-  exit 1
+export HOME=$(printf '%q' "$host_home")
+export USER=chronos
+export LOGNAME=chronos
+export SHELL=/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+export RUSTUP_HOME=$(printf '%q' "$host_home/.rustup")
+export CARGO_HOME=$(printf '%q' "$host_home/.cargo")
+export CROSS_WORK=$(printf '%q' "$CROSS_WORK/chronos")
+export CROSS_SESSION=1
+export LANG=C.UTF-8
+export LC_ALL=
+: "\${TERM:=dumb}"
+export TERM
+umask 022
+
+safe_cd() {
+  local requested="\$1"
+  case "\$requested" in
+    "\$HOME"|"\$HOME"/*|"\$CROSS_WORK"|"\$CROSS_WORK"/*)
+      cd -- "\$requested" 2>/dev/null || cd -- "\$HOME"
+      ;;
+    *)
+      cd -- "\$HOME"
+      ;;
+  esac
+}
+
+if [[ -z "\${SSH_ORIGINAL_COMMAND:-}" ]]; then
+  cd -- "\$HOME"
+  exec /bin/bash -l
 fi
 
-[[ -x "$ROOT/sbin/su-exec" ]] || {
-  echo "cross: Alpine environment is incomplete; rerun cross.sh" >&2
-  exit 1
+# The client emits Bash %q quoting. Authentication is limited to the dedicated
+# localhost key, and this process already runs as chronos inside the chroot.
+eval "set -- \$SSH_ORIGINAL_COMMAND"
+[[ "\${1:-}" == cross-session-v1 ]] || {
+  echo "cross-session: invalid client protocol" >&2
+  exit 126
 }
+shift
+(( \$# >= 2 )) || {
+  echo "cross-session: incomplete client protocol" >&2
+  exit 126
+}
+
+requested_cwd="\$1"
+mode="\$2"
+shift 2
+safe_cd "\$requested_cwd"
+
+case "\$mode" in
+  shell)
+    (( \$# == 0 )) || exit 126
+    exec /bin/bash -l
+    ;;
+  exec)
+    (( \$# > 0 )) || exit 126
+    exec "\$@"
+    ;;
+  *)
+    echo "cross-session: unknown mode" >&2
+    exit 126
+    ;;
+esac
+SESSION
+  sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-session"
+  sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-session"
+
+  cat <<SSHD | sudo tee "$CROSS_ROOT/etc/ssh/sshd_config_cross" >/dev/null
+Port $CROSS_SSH_PORT
+ListenAddress 127.0.0.1
+AddressFamily inet
+PidFile /run/cross-sshd.pid
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+PermitRootLogin no
+AllowUsers chronos
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+AuthorizedKeysFile /etc/ssh/cross_authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM no
+StrictModes yes
+
+ForceCommand /usr/local/libexec/cross-session
+DisableForwarding yes
+X11Forwarding no
+PermitTunnel no
+PermitUserRC no
+GatewayPorts no
+PermitTTY yes
+
+UseDNS no
+PrintMotd no
+PrintLastLog no
+LoginGraceTime 15
+MaxAuthTries 3
+MaxSessions 16
+ClientAliveInterval 60
+ClientAliveCountMax 3
+LogLevel VERBOSE
+SSHD
+  sudo chown root:root "$CROSS_ROOT/etc/ssh/sshd_config_cross"
+  sudo chmod 0600 "$CROSS_ROOT/etc/ssh/sshd_config_cross"
+
+  server_pub="$(sudo awk '{print $1, $2}' "$CROSS_ROOT/etc/ssh/ssh_host_ed25519_key.pub")"
+  printf 'cross-local %s\n' "$server_pub" > "$ssh_dir/known_hosts"
+  chmod 0600 "$ssh_dir/known_hosts"
+
+  cat > "$ssh_dir/config" <<SSHCFG
+Host cross-local
+  HostName 127.0.0.1
+  Port $CROSS_SSH_PORT
+  User chronos
+  IdentityFile $client_key
+  IdentitiesOnly yes
+  HostKeyAlias cross-local
+  UserKnownHostsFile $ssh_dir/known_hosts
+  GlobalKnownHostsFile /dev/null
+  StrictHostKeyChecking yes
+  UpdateHostKeys no
+  BatchMode yes
+  PasswordAuthentication no
+  KbdInteractiveAuthentication no
+  PreferredAuthentications publickey
+  ClearAllForwardings yes
+  ConnectTimeout 5
+  ConnectionAttempts 1
+  LogLevel ERROR
+SSHCFG
+  chmod 0600 "$ssh_dir/config"
+
+  {
+    printf 'CROSS_ROOT=%q\n' "$CROSS_ROOT"
+    printf 'CROSS_WORK=%q\n' "$CROSS_WORK"
+    printf 'HOST_HOME=%q\n' "$host_home"
+    printf 'HOST_UID=%q\n' "$uid"
+    printf 'HOST_GID=%q\n' "$gid"
+    printf 'CHROOT_BIN=%q\n' "$CHROOT_BIN"
+    printf 'HOST_SSH_BIN=%q\n' "$HOST_SSH_BIN"
+    printf 'CROSS_SSH_PORT=%q\n' "$CROSS_SSH_PORT"
+  } | sudo tee "$CROSS_ETC/cross.conf" >/dev/null
+  sudo chown root:root "$CROSS_ETC/cross.conf"
+  sudo chmod 0644 "$CROSS_ETC/cross.conf"
+
+  cat > "$CROSS_BIN/cross-service" <<'SERVICE'
+#!/bin/bash
+set -Eeuo pipefail
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PREFIX="$(dirname -- "$SELF_DIR")"
+CONFIG="$PREFIX/etc/cross.conf"
+[[ -r "$CONFIG" ]] || { echo "cross-service: missing $CONFIG" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG"
+
+PID_FILE="$CROSS_ROOT/run/cross-sshd.pid"
+LOG_FILE="$CROSS_ROOT/var/log/cross-sshd.log"
+
+info() { printf 'cross-service: %s\n' "$*"; }
+die()  { printf 'cross-service: %s\n' "$*" >&2; exit 1; }
 
 is_mounted() {
   awk -v target="$1" '$2 == target { found=1 } END { exit !found }' /proc/mounts
@@ -508,117 +754,311 @@ mount_proc() {
   fi
 }
 
-ensure_apk_compat() {
-  local execdir="$ROOT/lib/apk/exec"
-  local probe="$execdir/.cross-exec-probe"
-  local version
-
-  [[ -x "$ROOT/sbin/apk.static" ]] || {
-    echo "cross: Alpine apk-tools v2 compatibility runner is missing; rerun cross.sh" >&2
-    exit 1
-  }
-  version="$(sudo "$CHROOT_BIN" "$ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
-  case "$version" in
-    apk-tools\ 2.*) ;;
-    *) echo "cross: unexpected compatibility apk version: $version" >&2; exit 1 ;;
-  esac
-
-  sudo mkdir -p "$execdir"
-  printf '%s\n' '#!/bin/sh' 'exit 0' | sudo tee "$probe" >/dev/null
-  sudo chmod 0755 "$probe"
-  if ! sudo "$CHROOT_BIN" "$ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
-    sudo rm -f "$probe"
-    echo "cross: ChromeOS denies apk file-backed package scripts" >&2
-    exit 1
-  fi
-  sudo rm -f "$probe"
+ensure_vt2_context() {
+  local nnp
+  nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
+  [[ "$nnp" != 1 ]] || die "start/stop must be run from VT-2, not browser crosh"
+  command -v sudo >/dev/null 2>&1 || die "sudo is required"
+  sudo true
 }
+
 ensure_chroot_exec() {
   local security_mnt="/sys/kernel/security"
   local policy_file="$security_mnt/chromiumos/inode_security_policies/allow_symlink"
   local mounted_here=0 remounted_rw=0 security_opts=""
 
-  if sudo "$CHROOT_BIN" "$ROOT" /bin/busybox true >/dev/null 2>&1; then
+  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/busybox true >/dev/null 2>&1; then
     return 0
   fi
 
   sudo mkdir -p "$security_mnt"
   if ! awk -v target="$security_mnt" '$2 == target { found=1 } END { exit !found }' /proc/mounts; then
-    sudo mount -t securityfs -o nodev,noexec,nosuid securityfs "$security_mnt" || {
-      echo "cross: cannot mount ChromeOS securityfs" >&2
-      exit 1
-    }
+    sudo mount -t securityfs -o nodev,noexec,nosuid securityfs "$security_mnt" \
+      || die "cannot mount ChromeOS securityfs"
     mounted_here=1
   fi
 
   security_opts="$(awk -v target="$security_mnt" '$2 == target { print $4; exit }' /proc/mounts)"
-  if [[ ",${security_opts}," == *,ro,* ]]; then
-    sudo mount -o remount,rw "$security_mnt" || {
-      echo "cross: cannot remount ChromeOS securityfs read-write" >&2
-      exit 1
-    }
+  if [[ ",$security_opts," == *,ro,* ]]; then
+    sudo mount -o remount,rw "$security_mnt" \
+      || die "cannot remount ChromeOS securityfs read-write"
     remounted_rw=1
   fi
 
-  [[ -e "$policy_file" ]] || {
-    echo "cross: ChromeOS allow_symlink policy interface is unavailable" >&2
-    exit 1
-  }
-
+  [[ -e "$policy_file" ]] || die "ChromeOS allow_symlink policy interface is unavailable"
   printf '%s' '/mnt/stateful_partition/dev_image' | sudo tee "$policy_file" >/dev/null
-  if ! sudo "$CHROOT_BIN" "$ROOT" /bin/busybox true >/dev/null 2>&1; then
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/busybox true >/dev/null 2>&1; then
     printf '%s' '/mnt/stateful_partition' | sudo tee "$policy_file" >/dev/null
   fi
 
-  if (( remounted_rw )); then
-    sudo mount -o remount,ro "$security_mnt" >/dev/null 2>&1 || true
-  fi
-  if (( mounted_here )); then
-    sudo umount "$security_mnt" >/dev/null 2>&1 || true
-  fi
+  (( remounted_rw == 0 )) || sudo mount -o remount,ro "$security_mnt" >/dev/null 2>&1 || true
+  (( mounted_here == 0 )) || sudo umount "$security_mnt" >/dev/null 2>&1 || true
 
-  sudo "$CHROOT_BIN" "$ROOT" /bin/busybox true >/dev/null 2>&1 || {
-    echo "cross: ChromeOS still denies execution inside the Alpine rootfs" >&2
-    exit 1
-  }
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/busybox true >/dev/null 2>&1 \
+    || die "ChromeOS still denies execution inside the Alpine rootfs"
 }
 
-sudo cp -f /etc/resolv.conf "$ROOT/etc/resolv.conf"
-[[ -f /etc/hosts ]] && sudo cp -f /etc/hosts "$ROOT/etc/hosts" || true
+prepare_mounts() {
+  sudo cp -f /etc/resolv.conf "$CROSS_ROOT/etc/resolv.conf"
+  [[ ! -f /etc/hosts ]] || sudo cp -f /etc/hosts "$CROSS_ROOT/etc/hosts"
 
-mount_bind /dev "$ROOT/dev" 1
-mount_proc "$ROOT/proc"
-mount_bind /sys "$ROOT/sys" 1
-[[ -d /run ]] && mount_bind /run "$ROOT/run" 1 || true
-mount_bind "$HOST_HOME" "$ROOT$HOST_HOME" 0
-ensure_chroot_exec
-ensure_apk_compat
+  mount_bind /dev "$CROSS_ROOT/dev" 1
+  mount_proc "$CROSS_ROOT/proc"
+  mount_bind /sys "$CROSS_ROOT/sys" 1
+  mount_bind "$HOST_HOME" "$CROSS_ROOT$HOST_HOME" 0
+  mount_bind "$CROSS_WORK" "$CROSS_ROOT$CROSS_WORK" 0
 
-case "$PWD" in
-  "$HOST_HOME"|"$HOST_HOME"/*) CROSS_CWD="$PWD" ;;
-  *) CROSS_CWD="$HOST_HOME" ;;
+  sudo mkdir -p "$CROSS_ROOT/run" "$CROSS_ROOT/var/log" "$CROSS_ROOT/run/sshd"
+  ensure_chroot_exec
+}
+
+master_pid() {
+  [[ -r "$PID_FILE" ]] || return 1
+  local pid
+  read -r pid < "$PID_FILE" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  sudo kill -0 "$pid" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$pid"
+}
+
+chroot_pids() {
+  local proc pid root
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    root="$(sudo readlink "$proc/root" 2>/dev/null || true)"
+    [[ "$root" == "$CROSS_ROOT" ]] && printf '%s\n' "$pid"
+  done
+}
+
+unmount_runtime() {
+  local target
+  for target in \
+    "$CROSS_ROOT$CROSS_WORK" \
+    "$CROSS_ROOT$HOST_HOME" \
+    "$CROSS_ROOT/run" \
+    "$CROSS_ROOT/sys" \
+    "$CROSS_ROOT/proc" \
+    "$CROSS_ROOT/dev"; do
+    is_mounted "$target" && sudo umount -l "$target" >/dev/null 2>&1 || true
+  done
+}
+
+auth_probe() {
+  local remote quoted err_file status
+  err_file="$PREFIX/run/cross-auth-probe.log"
+  printf -v quoted '%q' "$HOST_HOME"
+  remote="cross-session-v1 $quoted exec /bin/true"
+  : > "$err_file"
+  set +e
+  "$HOST_SSH_BIN" -F "$PREFIX/etc/ssh/config" -T cross-local "$remote" \
+    </dev/null >/dev/null 2>"$err_file"
+  status=$?
+  set -e
+  return "$status"
+}
+
+show_auth_failure() {
+  echo "cross-service: localhost SSH authentication probe failed" >&2
+  [[ ! -s "$PREFIX/run/cross-auth-probe.log" ]] \
+    || sed 's/^/client: /' "$PREFIX/run/cross-auth-probe.log" >&2
+  [[ ! -r "$LOG_FILE" ]] \
+    || sudo tail -n 80 "$LOG_FILE" | sed 's/^/sshd: /' >&2 || true
+}
+
+start_service() {
+  ensure_vt2_context
+  if pid="$(master_pid 2>/dev/null)"; then
+    if auth_probe; then
+      info "running and authenticated (pid $pid, 127.0.0.1:$CROSS_SSH_PORT)"
+      return 0
+    fi
+    show_auth_failure
+    die "sshd is running but public-key authentication is not working; rerun cross.sh"
+  fi
+
+  sudo rm -f "$PID_FILE"
+  prepare_mounts
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd \
+    -t -f /etc/ssh/sshd_config_cross
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd \
+    -f /etc/ssh/sshd_config_cross -E /var/log/cross-sshd.log
+
+  local i pid=""
+  for ((i=1; i<=30; i++)); do
+    if pid="$(master_pid 2>/dev/null)" && auth_probe; then
+      info "started and authenticated (pid $pid, 127.0.0.1:$CROSS_SSH_PORT)"
+      return 0
+    fi
+    sleep 0.1
+  done
+  show_auth_failure
+  stop_service >/dev/null 2>&1 || true
+  die "sshd did not pass the public-key authentication probe"
+}
+
+stop_service() {
+  ensure_vt2_context
+  local pid pids
+  if pid="$(master_pid 2>/dev/null)"; then
+    sudo kill -TERM "$pid" >/dev/null 2>&1 || true
+  fi
+
+  pids="$(chroot_pids || true)"
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086
+    sudo kill -TERM $pids >/dev/null 2>&1 || true
+    sleep 0.5
+    pids="$(chroot_pids || true)"
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      sudo kill -KILL $pids >/dev/null 2>&1 || true
+    fi
+  fi
+
+  sudo rm -f "$PID_FILE"
+  unmount_runtime
+  info "stopped"
+}
+
+status_service() {
+  local pid
+  if pid="$(master_pid 2>/dev/null)"; then
+    info "running (pid $pid, 127.0.0.1:$CROSS_SSH_PORT)"
+  else
+    info "stopped"
+    return 3
+  fi
+}
+
+doctor_service() {
+  ensure_vt2_context
+  local client_blob auth_blob mode owner
+  printf 'Service:        '
+  status_service || true
+  client_blob="$(awk 'NF >= 2 {print $2; exit}' "$PREFIX/etc/ssh/cross_client_ed25519.pub" 2>/dev/null || true)"
+  auth_blob="$(sudo awk 'NF >= 2 {print $2; exit}' "$CROSS_ROOT/etc/ssh/cross_authorized_keys" 2>/dev/null || true)"
+  mode="$(sudo stat -c '%a' "$CROSS_ROOT/etc/ssh/cross_authorized_keys" 2>/dev/null || true)"
+  owner="$(sudo stat -c '%U:%G' "$CROSS_ROOT/etc/ssh/cross_authorized_keys" 2>/dev/null || true)"
+  printf 'AuthorizedKeys: owner=%s mode=%s readable-as-chronos=' "${owner:-missing}" "${mode:-missing}"
+  if sudo -u "#$HOST_UID" test -r "$CROSS_ROOT/etc/ssh/cross_authorized_keys" 2>/dev/null; then
+    echo yes
+  else
+    echo no
+  fi
+  if [[ -n "$client_blob" && "$client_blob" == "$auth_blob" ]]; then
+    echo 'Key match:      yes'
+  else
+    echo 'Key match:      no'
+  fi
+  echo 'Effective SSH settings:'
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd -T \
+    -f /etc/ssh/sshd_config_cross \
+    -C user=chronos,host=localhost,addr=127.0.0.1 2>/dev/null \
+    | grep -E '^(port|listenaddress|allowusers|pubkeyauthentication|authenticationmethods|authorizedkeysfile|strictmodes|forcecommand) ' \
+    || true
+  if master_pid >/dev/null 2>&1; then
+    if auth_probe; then
+      echo 'Authentication: success'
+    else
+      echo 'Authentication: failed'
+      show_auth_failure
+      return 1
+    fi
+  else
+    echo 'Authentication: not tested (service stopped)'
+  fi
+}
+
+case "${1:-status}" in
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) stop_service; start_service ;;
+  status) status_service ;;
+  doctor) doctor_service ;;
+  log) sudo tail -n "${2:-80}" "$LOG_FILE" ;;
+  *) die "usage: cross-service {start|stop|restart|status|doctor|log [lines]}" ;;
+esac
+SERVICE
+  chmod 0755 "$CROSS_BIN/cross-service"
+
+  cat > "$CROSS_BIN/cross" <<'CLIENT'
+#!/bin/bash
+set -Eeuo pipefail
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PREFIX="$(dirname -- "$SELF_DIR")"
+CONFIG="$PREFIX/etc/cross.conf"
+SSH_CONFIG="$PREFIX/etc/ssh/config"
+[[ -r "$CONFIG" ]] || { echo "cross: missing $CONFIG; rerun cross.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG"
+[[ -x "$HOST_SSH_BIN" ]] || { echo "cross: host ssh is unavailable: $HOST_SSH_BIN" >&2; exit 1; }
+[[ -r "$SSH_CONFIG" ]] || { echo "cross: missing SSH client configuration" >&2; exit 1; }
+
+pty=auto
+case "${1:-}" in
+  -t) pty=yes; shift ;;
+  -T) pty=no; shift ;;
+  --) shift ;;
 esac
 
+case "$PWD" in
+  "$HOST_HOME"|"$HOST_HOME"/*|"$CROSS_WORK/chronos"|"$CROSS_WORK/chronos"/*)
+    remote_cwd="$PWD"
+    ;;
+  *)
+    remote_cwd="$HOST_HOME"
+    ;;
+esac
+
+remote='cross-session-v1'
+printf -v quoted '%q' "$remote_cwd"
+remote+=" $quoted"
 if (( $# == 0 )); then
-  set -- /bin/bash -l
+  remote+=' shell'
+  if [[ "$pty" == auto ]]; then
+    if [[ -t 0 && -t 1 ]]; then pty=yes; else pty=no; fi
+  fi
+else
+  remote+=' exec'
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    remote+=" $quoted"
+  done
+  [[ "$pty" != auto ]] || pty=no
 fi
 
-exec sudo "$CHROOT_BIN" "$ROOT" /usr/bin/env -i \
-  HOME="$HOST_HOME" \
-  USER=chronos \
-  LOGNAME=chronos \
-  SHELL=/bin/bash \
-  TERM="${TERM:-linux}" \
-  LANG="${LANG:-C.UTF-8}" \
-  LC_ALL="${LC_ALL:-}" \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-  GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
-  RUSTUP_HOME="$HOST_HOME/.rustup" \
-  CARGO_HOME="$HOST_HOME/.cargo" \
-  /sbin/su-exec "$HOST_UID:$HOST_GID" \
-  /bin/sh -c 'cd "$1"; shift; exec "$@"' sh "$CROSS_CWD" "$@"
-LAUNCHER
+ssh_args=(-F "$SSH_CONFIG")
+case "$pty" in
+  yes) ssh_args+=(-t) ;;
+  no) ssh_args+=(-T) ;;
+esac
+
+err_file="$(mktemp "$PREFIX/run/cross-client.XXXXXX")"
+trap 'rm -f "$err_file"' EXIT
+set +e
+"$HOST_SSH_BIN" "${ssh_args[@]}" cross-local "$remote" 2>"$err_file"
+status=$?
+set -e
+[[ ! -s "$err_file" ]] || cat "$err_file" >&2
+if (( status == 255 )); then
+  if grep -Fq 'Permission denied (publickey)' "$err_file"; then
+    cat >&2 <<MESSAGE
+cross: the VT-2 service answered, but public-key authentication failed.
+From VT-2 run:
+  $PREFIX/bin/cross-service doctor
+Then rerun the current cross.sh installer to repair the SSH key permissions.
+MESSAGE
+  else
+    cat >&2 <<MESSAGE
+cross: the VT-2 service is not reachable.
+Switch to VT-2, log in as chronos, and run:
+  $PREFIX/bin/cross-service start
+MESSAGE
+  fi
+fi
+exit "$status"
+CLIENT
   chmod 0755 "$CROSS_BIN/cross"
 
   local cmd
@@ -650,16 +1090,29 @@ write_profile() {
   local bashrc="${HOME:-/home/chronos/user}/.bashrc"
   local profile="${HOME:-/home/chronos/user}/.bash_profile"
   local begin='# >>> cross-alpine >>>'
+  local end='# <<< cross-alpine <<<'
+  local tmp
 
   touch "$bashrc" "$profile"
-  if ! grep -Fq "$begin" "$bashrc"; then
-    cat >> "$bashrc" <<'PROFILE'
-
-# >>> cross-alpine >>>
-export PATH="/usr/local/cross/bin:$PATH"
+  tmp="$(mktemp)"
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { skip=1; next }
+    $0 == end { skip=0; next }
+    !skip { print }
+  ' "$bashrc" > "$tmp"
+  {
+    printf '\n# >>> cross-alpine >>>\n'
+    printf 'export CROSS_WORK=%q\n' "$CROSS_WORK/chronos"
+    cat <<'PROFILE'
+if [ -z "${CROSS_SESSION:-}" ]; then
+  export PATH="/usr/local/cross/bin:$PATH"
+fi
 # <<< cross-alpine <<<
 PROFILE
-  fi
+  } >> "$tmp"
+  cat "$tmp" > "$bashrc"
+  rm -f "$tmp"
+
   if ! grep -Fq "$begin" "$profile"; then
     cat >> "$profile" <<'PROFILE'
 
@@ -671,13 +1124,11 @@ PROFILE
 }
 
 validate() {
-  info "Validating Alpine package environment"
+  info "Validating Alpine environment over localhost SSH"
 
-  ensure_file_backed_package_scripts
+  "$CROSS_BIN/cross-service" status
   "$CROSS_BIN/cross" apk --version
   "$CROSS_BIN/cross" git --version
-  # sed consumes the complete stream. Unlike head -n1, it does not close the
-  # pipe early and turn a successful producer into SIGPIPE under pipefail.
   "$CROSS_BIN/cross" curl --version | sed -n '1p'
   "$CROSS_BIN/cross" gcc --version | sed -n '1p'
   "$CROSS_BIN/cross" make --version | sed -n '1p'
@@ -686,9 +1137,10 @@ validate() {
   "$CROSS_BIN/cross" cargo --version
   "$CROSS_BIN/cross" node --version
   "$CROSS_BIN/cross" npm --version
+  "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
 
   local testdir
-  testdir="${HOME:-/home/chronos/user}/.cross-smoke-test.$$"
+  testdir="$CROSS_WORK/chronos/.cross-smoke-test.$$"
   mkdir -p "$testdir"
   cat > "$testdir/hello.c" <<'C_SOURCE'
 #include <stdio.h>
@@ -701,12 +1153,18 @@ C_SOURCE
 main() {
   preflight
   reset_or_prepare_prefix
+  quiesce_existing_service
   download_and_extract_rootfs
   configure_rootfs
   install_alpine_packages
   configure_chronos_user
-  write_launcher
+  write_ssh_service
   write_profile
+
+  # The installer-owned mounts must be released before cross-service starts;
+  # otherwise the EXIT trap would detach mounts from the running SSH daemon.
+  release_setup_mounts
+  "$CROSS_BIN/cross-service" restart
   validate
   printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_COMPLETE"
 
@@ -718,16 +1176,29 @@ All installed system tools and libraries came from signed Alpine ${ALPINE_BRANCH
 main/community packages. Package transactions use Alpine apk-tools v2 static
 from ${APK_COMPAT_BRANCH} because ChromeOS rejects apk-tools v3 memfd scripts.
 
+The runtime transport is a real localhost-only OpenSSH connection:
+  crosh cross -> host ssh -> VT-2-started cross-service -> Alpine chroot
+
 Activate wrappers in the current shell:
   source ~/.bashrc
 
-Examples:
+Service management from VT-2:
+  cross-service status
+  cross-service start
+  cross-service stop
+  cross-service restart
+  cross-service doctor
+
+Examples from crosh shell:
+  cross                 # interactive Alpine-backed SSH session
   git --version
   cc --version
-  node --version
-  rustup --version
-  cross                 # interactive Alpine-backed shell
-  cross apk upgrade     # update all Alpine packages
+  cross apk upgrade
+
+Executable build output belongs under:
+  $CROSS_WORK/chronos
+The ChromeOS home directory remains shared, but directly executing newly built
+files from the home filesystem may be denied by ChromeOS.
 
 Note: Alpine does not package nvm. Node.js and npm are supplied directly by apk.
 Log: $LOG_FILE

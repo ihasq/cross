@@ -35,7 +35,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-07-31.30-npx-work-cache"
+SCRIPT_VERSION="2026-07-31.31-vt2-eula"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -58,15 +58,83 @@ FETCH_TOOL=""
 CHROOT_BIN=""
 HOST_SSH_BIN=""
 ROOTFS_MOUNTED=()
-
-if command -v tee >/dev/null 2>&1; then
-  exec > >(tee -a "$LOG_FILE") 2>&1
-fi
+SETUP_STARTED=0
 
 info() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+enable_logging() {
+  if have tee; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+  fi
+}
+
+require_vt2_eula_context() {
+  local nnp
+
+  (( EUID != 0 )) || die "run as chronos, not as root"
+  [[ -f /etc/lsb-release ]] || die "this does not look like the ChromeOS host"
+  have sudo || die "sudo is required; run from VT-2 in Developer Mode"
+
+  nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
+  [[ "$nnp" != 1 ]] || die "run from VT-2, not browser crosh"
+  [[ -c /dev/tty ]] || die "an interactive VT-2 terminal is required to accept the EULA"
+}
+
+show_eula_and_require_acceptance() {
+  local reply
+
+  cat <<'CROSS_EULA'
+
+Cross End User License Agreement (EULA)
+=======================================
+
+Cross is a successor project to Chromebrew. By accepting this agreement, you
+acknowledge and agree to all of the following:
+
+1. Cross is intended for ChromeOS Developer Mode and performs privileged system
+   operations. The installer uses sudo, writes below /usr/local/cross, creates
+   bind mounts and a chroot, may adjust the ChromeOS symlink security policy
+   until reboot, and starts a localhost-only OpenSSH service from VT-2.
+
+2. You are responsible for backing up important data, reviewing this script,
+   and deciding whether these changes are appropriate for your device. Developer
+   Mode and privileged modifications can reduce system security or cause data
+   loss if misused or interrupted.
+
+3. Cross is provided "AS IS", without warranties or guarantees of availability,
+   fitness, compatibility, security, or freedom from defects. You assume all
+   risk arising from installation and use, to the extent permitted by law.
+
+4. Alpine Linux and all other third-party packages remain governed by their own
+   licenses. This EULA does not replace or override those licenses.
+
+5. Acceptance authorizes this installer to perform the operations described
+   above. If you do not accept, the installer will exit without beginning setup.
+CROSS_EULA
+
+  while :; do
+    printf '\nDo you accept the Cross EULA? [y/n]: ' >/dev/tty
+    if ! IFS= read -r reply </dev/tty; then
+      die "unable to read the EULA response from VT-2"
+    fi
+    case "$reply" in
+      y|Y)
+        info "EULA accepted"
+        return 0
+        ;;
+      n|N|'')
+        printf '\nCross EULA not accepted; setup cancelled.\n' >/dev/tty
+        exit 1
+        ;;
+      *)
+        printf 'Please answer y or n.\n' >/dev/tty
+        ;;
+    esac
+  done
+}
 
 release_setup_mounts() {
   local i target
@@ -80,7 +148,7 @@ release_setup_mounts() {
 cleanup() {
   local status=$?
   release_setup_mounts
-  if (( status != 0 )); then
+  if (( status != 0 && SETUP_STARTED != 0 )); then
     printf '\nSetup failed. Log: %s\n' "$LOG_FILE" >&2
   fi
 }
@@ -1351,6 +1419,10 @@ C_SOURCE
 }
 
 main() {
+  require_vt2_eula_context
+  show_eula_and_require_acceptance
+  enable_logging
+  SETUP_STARTED=1
   preflight
   reset_or_prepare_prefix
   quiesce_existing_service

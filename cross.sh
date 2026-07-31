@@ -11,6 +11,9 @@
 #   * a chroot is used only to give Alpine binaries their expected /lib and /usr
 #   * the ChromeOS home directory is bind-mounted at the identical path
 #   * all compiler/runtime/library files are obtained from Alpine repositories
+#   * apk-tools v2 static from Alpine v3.22 is retained only as the package-
+#     transaction runner because ChromeOS rejects apk-tools v3 executable memfd
+#     package scripts; Alpine v3.24 still publishes v2 indexes/packages
 #
 # Run once from VT-2 as chronos:
 #   bash ~/Downloads/cross.sh
@@ -29,9 +32,10 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-07-31.22-apk-script-hardlink-sh"
+SCRIPT_VERSION="2026-07-31.24-apk-v2-script-runner"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
+APK_COMPAT_BRANCH="v3.22"
 CROSS_PREFIX="${CROSS_PREFIX:-/usr/local/cross}"
 CROSS_ROOT="$CROSS_PREFIX/alpine"
 CROSS_BIN="$CROSS_PREFIX/bin"
@@ -129,67 +133,53 @@ mount_proc() {
   fi
 }
 
-# Alpine package scripts use #!/bin/sh and apk invokes them directly. On some
-# ChromeOS kernels, an executable script inside the chroot is rejected when its
-# shebang interpreter (/bin/sh) is itself a symlink on the stateful partition,
-# even though the BusyBox ELF target executes normally. Preserve Alpine's
-# BusyBox shell semantics while avoiding that extra symlink traversal by making
-# /bin/sh a hard link to /bin/busybox. Proceed only after a real direct-script
-# execution probe succeeds.
-ensure_apk_script_exec() {
+# apk-tools v3 stores package scripts in executable memfd objects and invokes
+# those objects directly. The ChromeOS kernel on this device rejects that
+# execve path with EACCES, even though normal executable files under /usr/local
+# work. apk-tools v2 uses a file-backed script under /lib/apk/exec instead.
+# Verify that exact path before using the compatibility transaction runner.
+ensure_file_backed_package_scripts() {
   local execdir="$CROSS_ROOT/lib/apk/exec"
   local probe="$execdir/.cross-exec-probe"
-  local altprobe="$execdir/.cross-exec-probe-busybox"
-  local marker="$CROSS_ROOT/etc/.cross-bin-sh-hardlink"
-
-  relink_busybox_sh() {
-    [[ -x "$CROSS_ROOT/bin/busybox" ]] || die "Alpine BusyBox is unavailable"
-    if [[ -L "$CROSS_ROOT/bin/sh" ]] || [[ ! -e "$CROSS_ROOT/bin/sh" ]] || \
-       [[ "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/sh" 2>/dev/null || true)" != \
-          "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/busybox")" ]]; then
-      sudo rm -f "$CROSS_ROOT/bin/sh"
-      sudo ln "$CROSS_ROOT/bin/busybox" "$CROSS_ROOT/bin/sh" \
-        || die "cannot create the Alpine /bin/sh BusyBox hard link"
-    fi
-    sudo chmod 0755 "$CROSS_ROOT/bin/busybox" "$CROSS_ROOT/bin/sh"
-    [[ ! -L "$CROSS_ROOT/bin/sh" ]] || die "Alpine /bin/sh is still a symbolic link"
-    [[ "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/sh")" == \
-       "$(sudo stat -c '%d:%i' "$CROSS_ROOT/bin/busybox")" ]] \
-      || die "Alpine /bin/sh is not hard-linked to BusyBox"
-  }
-
-  # Once this ChromeOS-specific mode has been selected, keep the hard link in
-  # sync after future BusyBox upgrades replace /bin/busybox with a new inode.
-  [[ -f "$marker" ]] && relink_busybox_sh
 
   sudo mkdir -p "$execdir"
   printf '%s\n' '#!/bin/sh' 'exit 0' | sudo tee "$probe" >/dev/null
   sudo chmod 0755 "$probe"
-
-  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
     sudo rm -f "$probe"
-    return 0
+    die "ChromeOS denies apk-tools v2 file-backed package scripts"
   fi
+  sudo rm -f "$probe"
+}
 
-  warn "Direct Alpine shell scripts are denied; replacing /bin/sh symlink with a BusyBox hard link"
-  relink_busybox_sh
-  sudo touch "$marker"
+bootstrap_apk_v2_runner() {
+  local compat_repositories="$CROSS_ROOT/etc/apk/repositories.apk2"
+  local version
 
-  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
-    sudo rm -f "$probe"
-    return 0
-  fi
+  info "Installing Alpine apk-tools v2 compatibility runner"
+  cat <<REPOS | sudo tee "$compat_repositories" >/dev/null
+https://dl-cdn.alpinelinux.org/alpine/${APK_COMPAT_BRANCH}/main
+REPOS
 
-  # Distinguish a remaining /bin/sh issue from a blanket script-execution ban.
-  printf '%s\n' '#!/bin/busybox sh' 'exit 0' | sudo tee "$altprobe" >/dev/null
-  sudo chmod 0755 "$altprobe"
-  if sudo "$CHROOT_BIN" "$CROSS_ROOT" /lib/apk/exec/.cross-exec-probe-busybox >/dev/null 2>&1; then
-    sudo rm -f "$probe" "$altprobe"
-    die "ChromeOS accepts a BusyBox shebang but still rejects #!/bin/sh"
-  fi
+  # Use the minirootfs' apk v3 only for this script-free bootstrap transaction.
+  # The repository file contains only Alpine v3.22, whose apk-tools-static is
+  # the final apk-tools v2 release line. No package hook is executed here.
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
+    --repositories-file /etc/apk/repositories.apk2 \
+    --scripts=no --commit-hooks=no add --no-cache apk-tools-static
 
-  sudo rm -f "$probe" "$altprobe"
-  die "ChromeOS denies direct script execution inside the Alpine rootfs even with a non-symlink interpreter"
+  [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
+    || die "Alpine apk-tools v2 static binary was not installed"
+  version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | head -n1)"
+  [[ "$version" == apk-tools\ 2.* ]] \
+    || die "unexpected compatibility apk version: $version"
+  printf 'Compatibility apk: %s\n' "$version"
+
+  # Put the compatibility runner first in the chroot PATH. The packaged apk v3
+  # remains available as /sbin/apk for inspection, but package transactions use
+  # /sbin/apk.static so their hooks follow the file-backed execution path.
+  sudo mkdir -p "$CROSS_ROOT/usr/local/sbin"
+  sudo ln -sfn /sbin/apk.static "$CROSS_ROOT/usr/local/sbin/apk"
 }
 # ChromeOS blocks symlink traversal on the stateful partition by default.
 # Alpine root filesystems contain essential symlinks (for example /bin/sh and
@@ -374,11 +364,12 @@ REPOS
   [[ -d /run ]] && mount_bind /run "$CROSS_ROOT/run" 1 || true
 
   ensure_chroot_exec
-  ensure_apk_script_exec
+  ensure_file_backed_package_scripts
+  bootstrap_apk_v2_runner
 }
 
 apk_chroot() {
-  sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk "$@"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static "$@"
 }
 
 install_alpine_packages() {
@@ -486,44 +477,31 @@ mount_proc() {
   fi
 }
 
-ensure_apk_script_exec() {
+ensure_apk_compat() {
   local execdir="$ROOT/lib/apk/exec"
   local probe="$execdir/.cross-exec-probe"
-  local marker="$ROOT/etc/.cross-bin-sh-hardlink"
+  local version
 
-  relink_busybox_sh() {
-    if [[ -L "$ROOT/bin/sh" ]] || [[ ! -e "$ROOT/bin/sh" ]] || \
-       [[ "$(sudo stat -c '%d:%i' "$ROOT/bin/sh" 2>/dev/null || true)" != \
-          "$(sudo stat -c '%d:%i' "$ROOT/bin/busybox")" ]]; then
-      sudo rm -f "$ROOT/bin/sh"
-      sudo ln "$ROOT/bin/busybox" "$ROOT/bin/sh" || {
-        echo "cross: cannot hard-link Alpine /bin/sh to BusyBox" >&2
-        exit 1
-      }
-    fi
-    sudo chmod 0755 "$ROOT/bin/busybox" "$ROOT/bin/sh"
+  [[ -x "$ROOT/sbin/apk.static" ]] || {
+    echo "cross: Alpine apk-tools v2 compatibility runner is missing; rerun cross.sh" >&2
+    exit 1
   }
-
-  [[ -f "$marker" ]] && relink_busybox_sh
+  version="$(sudo "$CHROOT_BIN" "$ROOT" /sbin/apk.static --version 2>&1 | head -n1)"
+  case "$version" in
+    apk-tools\ 2.*) ;;
+    *) echo "cross: unexpected compatibility apk version: $version" >&2; exit 1 ;;
+  esac
 
   sudo mkdir -p "$execdir"
   printf '%s\n' '#!/bin/sh' 'exit 0' | sudo tee "$probe" >/dev/null
   sudo chmod 0755 "$probe"
-  if sudo "$CHROOT_BIN" "$ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
-    sudo rm -f "$probe"
-    return 0
-  fi
-
-  relink_busybox_sh
-  sudo touch "$marker"
   if ! sudo "$CHROOT_BIN" "$ROOT" /lib/apk/exec/.cross-exec-probe >/dev/null 2>&1; then
     sudo rm -f "$probe"
-    echo "cross: ChromeOS still denies Alpine package scripts" >&2
+    echo "cross: ChromeOS denies apk file-backed package scripts" >&2
     exit 1
   fi
   sudo rm -f "$probe"
 }
-
 ensure_chroot_exec() {
   local security_mnt="/sys/kernel/security"
   local policy_file="$security_mnt/chromiumos/inode_security_policies/allow_symlink"
@@ -583,7 +561,7 @@ mount_bind /sys "$ROOT/sys" 1
 [[ -d /run ]] && mount_bind /run "$ROOT/run" 1 || true
 mount_bind "$HOST_HOME" "$ROOT$HOST_HOME" 0
 ensure_chroot_exec
-ensure_apk_script_exec
+ensure_apk_compat
 
 case "$PWD" in
   "$HOST_HOME"|"$HOST_HOME"/*) CROSS_CWD="$PWD" ;;
@@ -664,7 +642,8 @@ PROFILE
 validate() {
   info "Validating Alpine package environment"
 
-  ensure_apk_script_exec
+  ensure_file_backed_package_scripts
+  "$CROSS_BIN/cross" apk --version
   "$CROSS_BIN/cross" git --version
   "$CROSS_BIN/cross" curl --version | head -n1
   "$CROSS_BIN/cross" gcc --version | head -n1
@@ -703,7 +682,8 @@ main() {
 
 No source packages were built.
 All installed system tools and libraries came from signed Alpine ${ALPINE_BRANCH}
-main/community packages.
+main/community packages. Package transactions use Alpine apk-tools v2 static
+from ${APK_COMPAT_BRANCH} because ChromeOS rejects apk-tools v3 memfd scripts.
 
 Activate wrappers in the current shell:
   source ~/.bashrc

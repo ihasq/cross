@@ -35,7 +35,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-07-31.27-ssh-auth-readable-keys"
+SCRIPT_VERSION="2026-07-31.30-npx-work-cache"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -330,6 +330,7 @@ preflight() {
 
   opts="$(awk '$2 == "/usr/local" {print $4}' /proc/mounts | tail -n1)"
   [[ ",${opts}," != *,noexec,* ]] || die "/usr/local is mounted noexec"
+  [[ ",${opts}," != *,nosuid,* ]] || die "/usr/local is mounted nosuid; Alpine sudo requires setuid support"
 
   free_kib="$(df -Pk /usr/local | awk 'NR==2 {print $4}')"
   [[ "$free_kib" =~ ^[0-9]+$ ]] || free_kib=0
@@ -463,7 +464,7 @@ install_alpine_packages() {
     build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
-    rust cargo rustfmt rust-clippy rustup nodejs npm su-exec
+    rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec
   )
 
   # A real apk transaction performs dependency resolution before applying any
@@ -512,6 +513,34 @@ configure_chronos_user() {
   rm -f "$shadow_tmp"
 }
 
+configure_cross_sudo() {
+  info "Configuring passwordless sudo inside Alpine"
+
+  # The localhost SSH key is the sole login credential and the chronos account
+  # has no usable password. Configure sudo explicitly as passwordless rather
+  # than relying on an authentication path that can never succeed.
+  if ! sudo grep -q '^wheel:' "$CROSS_ROOT/etc/group"; then
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/addgroup -S wheel
+  fi
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/id -nG chronos \
+      | tr ' ' '\n' | grep -qx wheel; then
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/addgroup chronos wheel
+  fi
+
+  sudo mkdir -p "$CROSS_ROOT/etc/sudoers.d"
+  cat <<'SUDOERS' | sudo tee "$CROSS_ROOT/etc/sudoers.d/cross-chronos" >/dev/null
+Defaults:chronos secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults:chronos env_keep += "TERM LANG LC_ALL LC_CTYPE CROSS_WORK RUSTUP_HOME CARGO_HOME SSL_CERT_FILE GIT_SSL_CAINFO NPM_CONFIG_CACHE NPM_CONFIG_PREFIX COREPACK_HOME TMPDIR"
+chronos ALL=(ALL:ALL) NOPASSWD: ALL
+SUDOERS
+  sudo chown root:root "$CROSS_ROOT/etc/sudoers.d/cross-chronos"
+  sudo chmod 0440 "$CROSS_ROOT/etc/sudoers.d/cross-chronos"
+
+  [[ -u "$CROSS_ROOT/usr/bin/sudo" ]] \
+    || die "Alpine sudo is not setuid root; check /usr/local mount options"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/visudo -cf /etc/sudoers >/dev/null
+}
+
 write_ssh_service() {
   info "Writing localhost OpenSSH service and crosh client"
 
@@ -524,8 +553,11 @@ write_ssh_service() {
   client_pub="$client_key.pub"
 
   sudo mkdir -p "$ssh_dir" "$CROSS_ROOT/etc/ssh" "$CROSS_ROOT/usr/local/libexec" \
-    "$CROSS_ROOT/run" "$CROSS_ROOT/var/log" "$CROSS_WORK/chronos"
-  sudo chown "$uid:$gid" "$ssh_dir" "$CROSS_WORK/chronos"
+    "$CROSS_ROOT/usr/local/bin" "$CROSS_ROOT/run" "$CROSS_ROOT/var/log" \
+    "$CROSS_WORK/chronos/npm/cache" "$CROSS_WORK/chronos/npm/prefix/bin" \
+    "$CROSS_WORK/chronos/corepack" "$CROSS_WORK/chronos/tmp"
+  sudo chown "$uid:$gid" "$ssh_dir"
+  sudo chown -R "$uid:$gid" "$CROSS_WORK/chronos"
   sudo chmod 0700 "$ssh_dir"
 
   if [[ ! -s "$CROSS_ROOT/etc/ssh/ssh_host_ed25519_key" ]]; then
@@ -559,6 +591,52 @@ write_ssh_service() {
   sudo chown root:root "$CROSS_ROOT/etc/ssh/cross_authorized_keys"
   sudo chmod 0644 "$CROSS_ROOT/etc/ssh/cross_authorized_keys"
 
+  # Do not execute Alpine's /usr/bin/npx symlink. Invoke the npm CLI through
+  # node directly, and keep npx's symlink-heavy cache on the Developer Mode
+  # /usr/local tree rather than ChromeOS' stateful HOME mount.
+  cat <<'NPX_HELPER' | sudo tee "$CROSS_ROOT/usr/local/bin/npx" >/dev/null
+#!/bin/bash
+set -Eeuo pipefail
+
+: "${CROSS_WORK:=/usr/local/cross/work/chronos}"
+: "${NPM_CONFIG_CACHE:=$CROSS_WORK/npm/cache}"
+: "${NPM_CONFIG_PREFIX:=$CROSS_WORK/npm/prefix}"
+: "${COREPACK_HOME:=$CROSS_WORK/corepack}"
+: "${TMPDIR:=$CROSS_WORK/tmp}"
+export CROSS_WORK NPM_CONFIG_CACHE NPM_CONFIG_PREFIX COREPACK_HOME TMPDIR
+mkdir -p "$NPM_CONFIG_CACHE" "$NPM_CONFIG_PREFIX/bin" "$COREPACK_HOME" "$TMPDIR"
+
+# ChromeOS stateful HOME commonly has noexec/nosymfollow semantics. npx always
+# exposes local node_modules/.bin entries, so a project-local dependency tree
+# under HOME can still be unusable even though the remote npx cache is safe.
+# Detect that case and report the real constraint instead of surfacing ELOOP.
+case "$PWD" in
+  "$HOME"|"$HOME"/*)
+    dir="$PWD"
+    while :; do
+      if [[ -d "$dir/node_modules/.bin" ]] \
+          && find "$dir/node_modules/.bin" -mindepth 1 -maxdepth 1 -print -quit \
+             2>/dev/null | grep -q .; then
+        cat >&2 <<EOF
+npx: this project has local package executables under ChromeOS HOME:
+  $dir/node_modules/.bin
+ChromeOS may reject their symlink traversal or execution. Move the Node project
+under $CROSS_WORK, then reinstall dependencies there.
+EOF
+        exit 126
+      fi
+      [[ "$dir" == "$HOME" ]] && break
+      dir="${dir%/*}"
+      [[ -n "$dir" ]] || break
+    done
+    ;;
+esac
+
+exec /usr/bin/node /usr/lib/node_modules/npm/bin/npx-cli.js "$@"
+NPX_HELPER
+  sudo chown root:root "$CROSS_ROOT/usr/local/bin/npx"
+  sudo chmod 0755 "$CROSS_ROOT/usr/local/bin/npx"
+
   cat <<SESSION | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-session" >/dev/null
 #!/bin/bash
 set -Eeuo pipefail
@@ -567,18 +645,73 @@ export HOME=$(printf '%q' "$host_home")
 export USER=chronos
 export LOGNAME=chronos
 export SHELL=/bin/bash
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export CROSS_WORK=$(printf '%q' "$CROSS_WORK/chronos")
+export NPM_CONFIG_CACHE=$(printf '%q' "$CROSS_WORK/chronos/npm/cache")
+export NPM_CONFIG_PREFIX=$(printf '%q' "$CROSS_WORK/chronos/npm/prefix")
+export COREPACK_HOME=$(printf '%q' "$CROSS_WORK/chronos/corepack")
+export TMPDIR=$(printf '%q' "$CROSS_WORK/chronos/tmp")
+export PATH="\$NPM_CONFIG_PREFIX/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
 export RUSTUP_HOME=$(printf '%q' "$host_home/.rustup")
 export CARGO_HOME=$(printf '%q' "$host_home/.cargo")
-export CROSS_WORK=$(printf '%q' "$CROSS_WORK/chronos")
 export CROSS_SESSION=1
 export LANG=C.UTF-8
 export LC_ALL=
 : "\${TERM:=dumb}"
 export TERM
 umask 022
+mkdir -p "\$NPM_CONFIG_CACHE" "\$NPM_CONFIG_PREFIX/bin" "\$COREPACK_HOME" "\$TMPDIR"
+
+resolve_cross_tool() {
+  case "\$1" in
+    apk)              printf '%s\n' /sbin/apk.static ;;
+    bash)             printf '%s\n' /bin/bash ;;
+    sh)               printf '%s\n' /bin/sh ;;
+    git)              printf '%s\n' /usr/bin/git ;;
+    git-upload-pack)  printf '%s\n' /usr/bin/git-upload-pack ;;
+    git-receive-pack) printf '%s\n' /usr/bin/git-receive-pack ;;
+    curl)             printf '%s\n' /usr/bin/curl ;;
+    wget)             printf '%s\n' /usr/bin/wget ;;
+    ssh)              printf '%s\n' /usr/bin/ssh ;;
+    scp)              printf '%s\n' /usr/bin/scp ;;
+    cc)               printf '%s\n' /usr/bin/cc ;;
+    c++)              printf '%s\n' /usr/bin/c++ ;;
+    gcc)              printf '%s\n' /usr/bin/gcc ;;
+    g++)              printf '%s\n' /usr/bin/g++ ;;
+    cpp)              printf '%s\n' /usr/bin/cpp ;;
+    ar)               printf '%s\n' /usr/bin/ar ;;
+    as)               printf '%s\n' /usr/bin/as ;;
+    ld)               printf '%s\n' /usr/bin/ld ;;
+    nm)               printf '%s\n' /usr/bin/nm ;;
+    objdump)          printf '%s\n' /usr/bin/objdump ;;
+    ranlib)           printf '%s\n' /usr/bin/ranlib ;;
+    strip)            printf '%s\n' /usr/bin/strip ;;
+    make)             printf '%s\n' /usr/bin/make ;;
+    cmake)            printf '%s\n' /usr/bin/cmake ;;
+    ninja)            printf '%s\n' /usr/bin/ninja ;;
+    meson)            printf '%s\n' /usr/bin/meson ;;
+    pkg-config)       printf '%s\n' /usr/bin/pkg-config ;;
+    autoconf)         printf '%s\n' /usr/bin/autoconf ;;
+    autoheader)       printf '%s\n' /usr/bin/autoheader ;;
+    automake)         printf '%s\n' /usr/bin/automake ;;
+    aclocal)          printf '%s\n' /usr/bin/aclocal ;;
+    libtoolize)       printf '%s\n' /usr/bin/libtoolize ;;
+    m4)               printf '%s\n' /usr/bin/m4 ;;
+    rustup)           printf '%s\n' /usr/local/bin/rustup ;;
+    rustc)            printf '%s\n' /usr/bin/rustc ;;
+    cargo)            printf '%s\n' /usr/bin/cargo ;;
+    rustfmt)          printf '%s\n' /usr/bin/rustfmt ;;
+    clippy-driver)    printf '%s\n' /usr/bin/clippy-driver ;;
+    node)             printf '%s\n' /usr/bin/node ;;
+    npm)              printf '%s\n' /usr/bin/npm ;;
+    npx)              printf '%s\n' /usr/local/bin/npx ;;
+    corepack)         printf '%s\n' /usr/bin/corepack ;;
+    python3)          printf '%s\n' /usr/bin/python3 ;;
+    sudo)             printf '%s\n' /usr/bin/sudo ;;
+    *) return 1 ;;
+  esac
+}
 
 safe_cd() {
   local requested="\$1"
@@ -622,7 +755,18 @@ case "\$mode" in
     ;;
   exec)
     (( \$# > 0 )) || exit 126
-    exec "\$@"
+    command_name="\$1"
+    shift
+    case "\$command_name" in
+      */*) exec "\$command_name" "\$@" ;;
+      *)
+        resolved="\$(resolve_cross_tool "\$command_name" 2>/dev/null || true)"
+        if [[ -n "\$resolved" ]]; then
+          exec "\$resolved" "\$@"
+        fi
+        exec "\$command_name" "\$@"
+        ;;
+    esac
     ;;
   *)
     echo "cross-session: unknown mode" >&2
@@ -1061,16 +1205,58 @@ exit "$status"
 CLIENT
   chmod 0755 "$CROSS_BIN/cross"
 
-  local cmd
-  for cmd in \
-    apk bash sh git git-upload-pack git-receive-pack curl wget ssh scp \
-    cc c++ gcc g++ cpp ar as ld nm objdump ranlib strip make cmake ninja meson \
-    pkg-config autoconf autoheader automake aclocal libtoolize m4 \
-    rustup rustc cargo rustfmt clippy-driver \
-    node npm npx corepack python3; do
+  local spec cmd remote_path
+  local wrapper_specs=(
+    'apk:/sbin/apk.static'
+    'bash:/bin/bash'
+    'sh:/bin/sh'
+    'git:/usr/bin/git'
+    'git-upload-pack:/usr/bin/git-upload-pack'
+    'git-receive-pack:/usr/bin/git-receive-pack'
+    'curl:/usr/bin/curl'
+    'wget:/usr/bin/wget'
+    'ssh:/usr/bin/ssh'
+    'scp:/usr/bin/scp'
+    'cc:/usr/bin/cc'
+    'c++:/usr/bin/c++'
+    'gcc:/usr/bin/gcc'
+    'g++:/usr/bin/g++'
+    'cpp:/usr/bin/cpp'
+    'ar:/usr/bin/ar'
+    'as:/usr/bin/as'
+    'ld:/usr/bin/ld'
+    'nm:/usr/bin/nm'
+    'objdump:/usr/bin/objdump'
+    'ranlib:/usr/bin/ranlib'
+    'strip:/usr/bin/strip'
+    'make:/usr/bin/make'
+    'cmake:/usr/bin/cmake'
+    'ninja:/usr/bin/ninja'
+    'meson:/usr/bin/meson'
+    'pkg-config:/usr/bin/pkg-config'
+    'autoconf:/usr/bin/autoconf'
+    'autoheader:/usr/bin/autoheader'
+    'automake:/usr/bin/automake'
+    'aclocal:/usr/bin/aclocal'
+    'libtoolize:/usr/bin/libtoolize'
+    'm4:/usr/bin/m4'
+    'rustup:/usr/local/bin/rustup'
+    'rustc:/usr/bin/rustc'
+    'cargo:/usr/bin/cargo'
+    'rustfmt:/usr/bin/rustfmt'
+    'clippy-driver:/usr/bin/clippy-driver'
+    'node:/usr/bin/node'
+    'npm:/usr/bin/npm'
+    'npx:/usr/local/bin/npx'
+    'corepack:/usr/bin/corepack'
+    'python3:/usr/bin/python3'
+  )
+  for spec in "${wrapper_specs[@]}"; do
+    cmd="${spec%%:*}"
+    remote_path="${spec#*:}"
     cat > "$CROSS_BIN/$cmd" <<WRAPPER
 #!/bin/sh
-exec "$CROSS_BIN/cross" "$cmd" "\$@"
+exec "$CROSS_BIN/cross" "$remote_path" "\$@"
 WRAPPER
     chmod 0755 "$CROSS_BIN/$cmd"
   done
@@ -1104,7 +1290,15 @@ write_profile() {
     printf '\n# >>> cross-alpine >>>\n'
     printf 'export CROSS_WORK=%q\n' "$CROSS_WORK/chronos"
     cat <<'PROFILE'
-if [ -z "${CROSS_SESSION:-}" ]; then
+if [ -n "${CROSS_SESSION:-}" ]; then
+  case $- in
+    *i*)
+      # Distinguish the Alpine SSH session from the ChromeOS host shell while
+      # retaining a compact crosh-like coloured prompt. \W renders HOME as ~.
+      PS1='\[\e[1;32m\]cross@localhost\[\e[0m\] \[\e[1;34m\]\W\[\e[0m\] $ '
+      ;;
+  esac
+else
   export PATH="/usr/local/cross/bin:$PATH"
 fi
 # <<< cross-alpine <<<
@@ -1137,7 +1331,13 @@ validate() {
   "$CROSS_BIN/cross" cargo --version
   "$CROSS_BIN/cross" node --version
   "$CROSS_BIN/cross" npm --version
+  "$CROSS_BIN/cross" npx --version
   "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
+  "$CROSS_BIN/cross" /bin/sh -c 'test "$(command -v npx)" = /usr/local/bin/npx'
+  "$CROSS_BIN/cross" /bin/sh -c 'test "$(npm config get cache)" = "$NPM_CONFIG_CACHE"'
+  "$CROSS_BIN/cross" /bin/sh -c 'd="$NPM_CONFIG_CACHE/.cross-link-probe.$$"; trap '"'"'rm -rf "$d"'"'"' EXIT; mkdir -p "$d"; printf ok > "$d/target"; ln -s target "$d/link"; test "$(cat "$d/link")" = ok'
+  [[ "$("$CROSS_BIN/cross" sudo -n /usr/bin/id -u)" == 0 ]] \
+    || die "Alpine sudo did not elevate chronos to uid 0"
 
   local testdir
   testdir="$CROSS_WORK/chronos/.cross-smoke-test.$$"
@@ -1158,6 +1358,7 @@ main() {
   configure_rootfs
   install_alpine_packages
   configure_chronos_user
+  configure_cross_sudo
   write_ssh_service
   write_profile
 
@@ -1194,6 +1395,10 @@ Examples from crosh shell:
   git --version
   cc --version
   cross apk upgrade
+  cross sudo -n id       # root inside the Alpine chroot
+
+The crosh host command sudo remains the ChromeOS sudo. Inside an interactive
+cross shell, or when invoked as cross sudo ..., sudo elevates inside Alpine.
 
 Executable build output belongs under:
   $CROSS_WORK/chronos
@@ -1201,6 +1406,9 @@ The ChromeOS home directory remains shared, but directly executing newly built
 files from the home filesystem may be denied by ChromeOS.
 
 Note: Alpine does not package nvm. Node.js and npm are supplied directly by apk.
+Node/npx cache: $CROSS_WORK/chronos/npm/cache
+Place Node projects with local node_modules under $CROSS_WORK/chronos to avoid
+ChromeOS HOME noexec/nosymfollow restrictions.
 Log: $LOG_FILE
 SUMMARY
 }

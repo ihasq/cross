@@ -24,8 +24,8 @@
 # After setup:
 #   source ~/.bashrc
 #   git --version
+#   apk info             # use the Alpine package manager directly
 #   cross                 # open an interactive Alpine-backed shell
-#   cross apk info        # inspect installed Alpine packages
 #
 # Important: nvm is not packaged by Alpine stable or Alpine edge/testing.
 # To keep this script strictly Alpine-only, Node.js and npm are installed from
@@ -1332,7 +1332,8 @@ WRAPPER
   cat > "$CROSS_BIN/nvm" <<'NVM_NOTICE'
 #!/bin/sh
 echo "nvm is not packaged by Alpine. This strict Alpine-only environment provides node and npm from apk." >&2
-echo "Use: apk upgrade nodejs npm" >&2
+echo "From ChromeOS use: cross sudo apk upgrade nodejs npm" >&2
+echo "Inside a cross shell use: sudo apk upgrade nodejs npm" >&2
 exit 2
 NVM_NOTICE
   chmod 0755 "$CROSS_BIN/nvm"
@@ -1389,7 +1390,9 @@ validate() {
   info "Validating Alpine environment over localhost SSH"
 
   "$CROSS_BIN/cross-service" status
-  "$CROSS_BIN/cross" apk --version
+  # Exercise the host-facing wrapper so setup guarantees that bare `apk`
+  # resolves to the Alpine compatibility runner once CROSS_BIN is on PATH.
+  "$CROSS_BIN/apk" --version
   "$CROSS_BIN/cross" git --version
   "$CROSS_BIN/cross" curl --version | sed -n '1p'
   "$CROSS_BIN/cross" gcc --version | sed -n '1p'
@@ -1464,9 +1467,10 @@ Service management from VT-2:
 
 Examples from crosh shell:
   cross                 # interactive Alpine-backed SSH session
+  apk info              # inspect Alpine packages through the default wrapper
   git --version
   cc --version
-  cross apk upgrade
+  cross sudo apk upgrade # package changes require Alpine root
   cross sudo -n id       # root inside the Alpine chroot
 
 The crosh host command sudo remains the ChromeOS sudo. Inside an interactive

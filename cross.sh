@@ -216,6 +216,64 @@ mount_proc() {
   fi
 }
 
+
+# Copy the active ChromeOS DNS configuration into Alpine.
+# ChromeOS does not always provide /etc/resolv.conf.
+sync_host_dns() {
+  local source="" candidate="" target="" temp=""
+
+  target="$CROSS_ROOT/etc/resolv.conf"
+
+  # Prefer ChromeOS-managed DNS. Preserve VPN and split-DNS
+  # resolver settings instead of forcing public DNS servers.
+  for candidate in \
+    /run/dns-proxy/resolv.conf \
+    /run/shill/resolv.conf \
+    /etc/resolv.conf \
+    /run/systemd/resolve/resolv.conf; do
+
+    [[ -f "$candidate" && -r "$candidate" && -s "$candidate" ]] \
+      || continue
+
+    # Reject empty files and files without usable nameserver entries.
+    if awk '
+      $1 == "nameserver" &&
+      NF >= 2 &&
+      $2 !~ /^#/ &&
+      $2 != "0.0.0.0" &&
+      $2 != "::" {
+        found=1
+      }
+      END { exit !found }
+    ' "$candidate"; then
+      source="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$source" ]]; then
+    warn "No usable ChromeOS DNS configuration found"
+    warn "Checked /run/dns-proxy, /run/shill and /etc/resolv.conf"
+    die "Cannot configure Alpine DNS. Check ChromeOS network connectivity."
+  fi
+
+  sudo mkdir -p "$CROSS_ROOT/etc"
+
+  # Atomic replacement. Do not follow any existing target symlink.
+  temp="$(sudo mktemp "$CROSS_ROOT/etc/.resolv.conf.cross.XXXXXXXX")"
+
+  if ! sudo cp -L -- "$source" "$temp"; then
+    sudo rm -f "$temp"
+    die "Failed to copy ChromeOS DNS configuration: $source"
+  fi
+
+  sudo chown root:root "$temp"
+  sudo chmod 0644 "$temp"
+  sudo mv -f -- "$temp" "$target"
+
+  info "Alpine DNS configured from $source"
+}
+
 # apk-tools v3 stores package scripts in executable memfd objects and invokes
 # those objects directly. The ChromeOS kernel on this device rejects that
 # execve path with EACCES, even though normal executable files under /usr/local
@@ -494,13 +552,18 @@ configure_rootfs() {
   info "Configuring Alpine repositories"
 
   sudo mkdir -p "$CROSS_ROOT/etc/apk" "$CROSS_ROOT/etc/ssl/certs"
+
   cat <<REPOS | sudo tee "$CROSS_ROOT/etc/apk/repositories" >/dev/null
 https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main
 https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community
 REPOS
 
-  sudo cp -f /etc/resolv.conf "$CROSS_ROOT/etc/resolv.conf"
-  [[ -f /etc/hosts ]] && sudo cp -f /etc/hosts "$CROSS_ROOT/etc/hosts" || true
+  # ChromeOS-compatible resolver configuration.
+  sync_host_dns
+
+  if [[ -f /etc/hosts ]]; then
+    sudo cp -L -f /etc/hosts "$CROSS_ROOT/etc/hosts"
+  fi
 
   mount_bind /dev "$CROSS_ROOT/dev" 1
   mount_proc "$CROSS_ROOT/proc"
@@ -1010,9 +1073,60 @@ ensure_chroot_exec() {
     || die "ChromeOS still denies execution inside the Alpine rootfs"
 }
 
+sync_runtime_dns() {
+  local source="" candidate="" target="" temp=""
+
+  target="$CROSS_ROOT/etc/resolv.conf"
+
+  for candidate in \
+    /run/dns-proxy/resolv.conf \
+    /run/shill/resolv.conf \
+    /etc/resolv.conf \
+    /run/systemd/resolve/resolv.conf; do
+
+    [[ -f "$candidate" && -r "$candidate" && -s "$candidate" ]] \
+      || continue
+
+    if awk '
+      $1 == "nameserver" &&
+      NF >= 2 &&
+      $2 !~ /^#/ &&
+      $2 != "0.0.0.0" &&
+      $2 != "::" {
+        found=1
+      }
+      END { exit !found }
+    ' "$candidate"; then
+      source="$candidate"
+      break
+    fi
+  done
+
+  [[ -n "$source" ]] \
+    || die "ChromeOS DNS unavailable; check /run/dns-proxy and /run/shill"
+
+  sudo mkdir -p "$CROSS_ROOT/etc"
+  temp="$(sudo mktemp "$CROSS_ROOT/etc/.resolv.conf.cross.XXXXXXXX")"
+
+  if ! sudo cp -L -- "$source" "$temp"; then
+    sudo rm -f "$temp"
+    die "Cannot copy DNS configuration from $source"
+  fi
+
+  sudo chown root:root "$temp"
+  sudo chmod 0644 "$temp"
+  sudo mv -f -- "$temp" "$target"
+
+  info "DNS synchronized from $source"
+}
+
 prepare_mounts() {
-  sudo cp -f /etc/resolv.conf "$CROSS_ROOT/etc/resolv.conf"
-  [[ ! -f /etc/hosts ]] || sudo cp -f /etc/hosts "$CROSS_ROOT/etc/hosts"
+  # Do not assume ChromeOS has /etc/resolv.conf.
+  sync_runtime_dns
+
+  if [[ -f /etc/hosts ]]; then
+    sudo cp -L -f /etc/hosts "$CROSS_ROOT/etc/hosts"
+  fi
 
   mount_bind /dev "$CROSS_ROOT/dev" 1
   mount_proc "$CROSS_ROOT/proc"
@@ -1020,7 +1134,11 @@ prepare_mounts() {
   mount_bind "$HOST_HOME" "$CROSS_ROOT$HOST_HOME" 0
   mount_bind "$CROSS_WORK" "$CROSS_ROOT$CROSS_WORK" 0
 
-  sudo mkdir -p "$CROSS_ROOT/run" "$CROSS_ROOT/var/log" "$CROSS_ROOT/run/sshd"
+  sudo mkdir -p \
+    "$CROSS_ROOT/run" \
+    "$CROSS_ROOT/var/log" \
+    "$CROSS_ROOT/run/sshd"
+
   ensure_chroot_exec
 }
 
@@ -1386,6 +1504,21 @@ PROFILE
   fi
 }
 
+validate_dns() {
+  info "Validating Alpine DNS"
+
+  "$CROSS_BIN/cross" /bin/sh -c '
+    test -s /etc/resolv.conf || exit 1
+
+    grep -Eq "^[[:space:]]*nameserver[[:space:]]+" \
+      /etc/resolv.conf || exit 1
+
+    getent ahosts dl-cdn.alpinelinux.org >/dev/null 2>&1
+  ' || die "Alpine DNS resolution failed"
+
+  info "Alpine DNS resolution OK"
+}
+
 validate() {
   info "Validating Alpine environment over localhost SSH"
 
@@ -1441,7 +1574,10 @@ main() {
   # otherwise the EXIT trap would detach mounts from the running SSH daemon.
   release_setup_mounts
   "$CROSS_BIN/cross-service" restart
+
+  validate_dns
   validate
+
   printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_COMPLETE"
 
   info "Setup complete"

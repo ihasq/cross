@@ -8,6 +8,7 @@ Disabling WPS is not neccesary.
 ### 1. Enter VT-2 and do this
 ```shell
 curl https://cross-sh.pages.dev/cross.sh | bash
+/usr/local/cross/bin/cross-service start
 ```
 
 ### 2. Open Crosh and do this

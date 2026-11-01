@@ -216,6 +216,45 @@ mount_proc() {
   fi
 }
 
+mount_home_executable() {
+  local target="$CROSS_ROOT$HOST_HOME"
+  local opts
+
+  # ChromeOS の HOME を同じ絶対パスで公開する。
+  mount_bind "$HOST_HOME" "$target" 0
+
+  # 元の HOME マウントは変更しない。
+  # Alpine が参照する bind mount だけを実行可能にする。
+  # nosuid,nodev は維持し、実行だけを許可する。
+  #
+  # nosymfollow が付いている環境では、この bind mount
+  # だけでシンボリックリンクの通過も可能にする。
+  opts="$(awk -v t="$target" \
+    '$2 == t { o=$4 } END { print o }' /proc/mounts)"
+
+  if [[ ",$opts," == *,nosymfollow,* ]]; then
+    sudo mount -o remount,bind,exec,symfollow,nosuid,nodev \
+      "$target" \
+      || die "cannot enable exec/symfollow on Alpine HOME bind mount"
+  else
+    sudo mount -o remount,bind,exec,nosuid,nodev \
+      "$target" \
+      || die "cannot enable exec on Alpine HOME bind mount"
+  fi
+
+  opts="$(awk -v t="$target" \
+    '$2 == t { o=$4 } END { print o }' /proc/mounts)"
+
+  [[ -n "$opts" ]] || die "Alpine HOME bind mount missing"
+
+  case ",$opts," in
+    *,noexec,*|*,nosymfollow,*)
+      die "Alpine HOME remains execution-restricted: $opts"
+      ;;
+  esac
+
+  info "Alpine HOME executable: $target"
+}
 
 # Copy the active ChromeOS DNS configuration into Alpine.
 # ChromeOS does not always provide /etc/resolv.conf.
@@ -1131,7 +1170,7 @@ prepare_mounts() {
   mount_bind /dev "$CROSS_ROOT/dev" 1
   mount_proc "$CROSS_ROOT/proc"
   mount_bind /sys "$CROSS_ROOT/sys" 1
-  mount_bind "$HOST_HOME" "$CROSS_ROOT$HOST_HOME" 0
+  mount_home_executable
   mount_bind "$CROSS_WORK" "$CROSS_ROOT$CROSS_WORK" 0
 
   sudo mkdir -p \
@@ -1520,6 +1559,28 @@ validate_dns() {
 }
 
 validate() {
+
+  info "Validating executable ChromeOS HOME inside Alpine"
+  
+  "$CROSS_BIN/cross" /bin/sh -s <<'HOME_EXEC_TEST'
+  set -eu
+  
+  probe="$(mktemp "$HOME/.cross-exec-test.XXXXXXXX")"
+  trap 'rm -f "$probe" "$probe.link"' EXIT
+  
+  # 実際の ELF バイナリを HOME に配置して実行する。
+  cp /bin/busybox "$probe"
+  chmod 0700 "$probe"
+  "$probe" true
+  
+  # シンボリックリンク経由の実行も確認する。
+  ln -s "$probe" "$probe.link"
+  "$probe.link" true
+  
+  echo "HOME ELF execution: OK"
+  echo "HOME symlink execution: OK"
+  HOME_EXEC_TEST
+
   info "Validating Alpine environment over localhost SSH"
 
   "$CROSS_BIN/cross-service" status

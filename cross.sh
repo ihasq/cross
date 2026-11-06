@@ -17,7 +17,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-06.36-workerd-gcompat"
+SCRIPT_VERSION="2026-11-06.37-host-updater"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -56,6 +56,9 @@ enable_logging() {
 require_vt2_eula_context() {
   local nnp
   (( EUID != 0 )) || die "run as chronos, not as root"
+  if [[ -n "${CROSS_SESSION:-}" ]]; then
+    die "cross.sh is running inside Alpine; update once with: /usr/bin/curl https://cross-sh.pages.dev/cross.sh | /bin/bash"
+  fi
   [[ -f /etc/lsb-release ]] || die "this does not look like the ChromeOS host"
   have sudo || die "sudo is required; run from VT-2 in Developer Mode"
   nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
@@ -143,14 +146,14 @@ fetch() {
   [[ -s "$out" ]] && return 0
   info "Downloading ${out##*/}"
   rm -f "$out.part"
-  case "$FETCH_TOOL" in
+  case "${FETCH_TOOL##*/}" in
     curl)
-      env -u LD_LIBRARY_PATH curl --fail --location --show-error --silent \
+      env -u LD_LIBRARY_PATH "$FETCH_TOOL" --fail --location --show-error --silent \
         --retry 5 --retry-delay 2 --proto '=https' --tlsv1.2 \
         --output "$out.part" "$url"
       ;;
     wget)
-      env -u LD_LIBRARY_PATH wget --https-only --tries=5 \
+      env -u LD_LIBRARY_PATH "$FETCH_TOOL" --https-only --tries=5 \
         --output-document="$out.part" "$url"
       ;;
     *) die "no download tool selected" ;;
@@ -325,9 +328,24 @@ preflight() {
   nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
   [[ "$nnp" != 1 ]] || die "NoNewPrivs active; use VT-2"
   sudo true
-  if have curl; then FETCH_TOOL="curl"
-  elif have wget; then FETCH_TOOL="wget"
-  else die "curl or wget required"; fi
+  # Always use a ChromeOS binary. Older Cross releases put curl and wget
+  # wrappers at the front of PATH; those wrappers become unusable as soon as
+  # the existing Cross service is stopped for maintenance.
+  for candidate in /usr/bin/curl /bin/curl /usr/local/bin/curl; do
+    if [[ -x "$candidate" && "$candidate" != "$CROSS_BIN/curl" ]]; then
+      FETCH_TOOL="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$FETCH_TOOL" ]]; then
+    for candidate in /usr/bin/wget /bin/wget /usr/local/bin/wget; do
+      if [[ -x "$candidate" && "$candidate" != "$CROSS_BIN/wget" ]]; then
+        FETCH_TOOL="$candidate"
+        break
+      fi
+    done
+  fi
+  [[ -n "$FETCH_TOOL" ]] || die "host curl or wget required"
   HOST_ARCH="$(uname -m)"
   case "$HOST_ARCH" in
     aarch64|arm64) ALPINE_ARCH="aarch64" ;;
@@ -1239,13 +1257,9 @@ CLIENT
   local spec cmd remote_path
   local wrapper_specs=(
     'apk:/sbin/apk.static'
-    'bash:/bin/bash'
-    'sh:/bin/sh'
     'git:/usr/bin/git'
     'git-upload-pack:/usr/bin/git-upload-pack'
     'git-receive-pack:/usr/bin/git-receive-pack'
-    'curl:/usr/bin/curl'
-    'wget:/usr/bin/wget'
     'ssh:/usr/bin/ssh'
     'scp:/usr/bin/scp'
     'cc:/usr/bin/cc'
@@ -1282,6 +1296,13 @@ CLIENT
     'corepack:/usr/bin/corepack'
     'python3:/usr/bin/python3'
   )
+
+  # These commands are part of the host-side bootstrap path. Shadowing them
+  # makes `curl .../cross.sh | bash` run the installer inside Alpine and makes
+  # updates depend on the service that the installer must stop. Remove files
+  # left by releases that generated wrappers for them.
+  rm -f "$CROSS_BIN/bash" "$CROSS_BIN/sh" "$CROSS_BIN/curl" "$CROSS_BIN/wget"
+
   for spec in "${wrapper_specs[@]}"; do
     cmd="${spec%%:*}"
     remote_path="${spec#*:}"

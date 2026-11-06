@@ -1,7 +1,7 @@
 #!/bin/bash
 # cross.sh - Alpine-packages-only development environment for ChromeOS Developer Mode.
 #
-# No source builds, containers, VMs, or mount namespaces. Alpine executes in a
+# No third-party source builds, containers, VMs, or mount namespaces. Alpine executes in a
 # chroot and is reached over a VT-2-started, localhost-only OpenSSH service.
 # The ChromeOS HOME is bind-mounted at the same path. The *bind mount only* is
 # remounted with exec, so HOME-resident ELF programs (e.g. cargo run output or
@@ -17,7 +17,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-02.35-boot-autostart"
+SCRIPT_VERSION="2026-11-06.36-workerd-gcompat"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -456,12 +456,33 @@ install_alpine_packages() {
     build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
-    rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec
+    rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
   )
   apk_chroot add --no-cache "${required[@]}"
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/update-ca-certificates || true
   sudo mkdir -p "$CROSS_ROOT/usr/local/bin"
   sudo ln -sfn /usr/bin/rustup-init "$CROSS_ROOT/usr/local/bin/rustup"
+}
+
+# npm's prebuilt workerd binaries use the glibc ELF interpreter. Alpine's
+# gcompat supplies that interpreter, but gcompat 1.1.0-r4 lacks __res_init,
+# which current workerd binaries reference. Supply only that missing alias;
+# this remains dynamically linked to Alpine musl and avoids vendoring glibc.
+configure_glibc_compat() {
+  local shim="/usr/local/lib/cross-gcompat-resolver.so"
+  info "Configuring glibc compatibility for prebuilt workerd"
+  sudo mkdir -p "$CROSS_ROOT/usr/local/lib"
+  printf '%s\n' \
+    '#include <resolv.h>' \
+    'int __res_init(void) { return res_init(); }' \
+    | sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/cc \
+        -shared -fPIC -O2 -Wl,-soname,cross-gcompat-resolver.so \
+        -x c - -o "$shim"
+  sudo chown root:root "$CROSS_ROOT$shim"
+  sudo chmod 0755 "$CROSS_ROOT$shim"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/nm -D "$shim" \
+    | grep -Eq '[[:space:]]__res_init$' \
+    || die "workerd compatibility shim does not export __res_init"
 }
 
 configure_chronos_user() {
@@ -561,6 +582,9 @@ export CROSS_WORK=$(printf '%q' "$CROSS_WORK/chronos")
 export PATH="\$HOME/.local/bin:\$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+# gcompat provides the glibc loader used by npm's workerd binary. This tiny
+# musl DSO supplies __res_init, which Alpine gcompat 1.1.0-r4 does not export.
+export LD_PRELOAD=/usr/local/lib/cross-gcompat-resolver.so
 export CROSS_SESSION=1
 export LANG=C.UTF-8
 export LC_ALL=
@@ -1434,6 +1458,13 @@ validate() {
   "$CROSS_BIN/cross" npm --version
   "$CROSS_BIN/cross" npx --version
   "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
+  "$CROSS_BIN/cross" /bin/sh -c '
+    test -r /usr/local/lib/cross-gcompat-resolver.so
+    test -e /lib64/ld-linux-x86-64.so.2 -o \
+         -e /lib/ld-linux-aarch64.so.1 -o \
+         -e /lib64/ld-linux-aarch64.so.1
+    test "$LD_PRELOAD" = /usr/local/lib/cross-gcompat-resolver.so
+  '
   "$CROSS_BIN/cross" /bin/sh -c 'test "$(command -v npx)" = /usr/bin/npx'
   [[ "$("$CROSS_BIN/cross" sudo -n /usr/bin/id -u)" == 0 ]] \
     || die "Alpine sudo did not elevate chronos to uid 0"
@@ -1462,6 +1493,7 @@ main() {
   download_and_extract_rootfs
   configure_rootfs
   install_alpine_packages
+  configure_glibc_compat
   configure_chronos_user
   configure_cross_sudo
   write_ssh_service
@@ -1479,9 +1511,11 @@ main() {
   info "Setup complete"
   cat <<SUMMARY
 
-No source packages were built; system tools and libraries came from Alpine
-${ALPINE_BRANCH} repositories. Transactions use Alpine apk-tools v2 static from
-${APK_COMPAT_BRANCH} because the current ChromeOS kernel rejects apk v3 memfd hooks.
+No third-party source packages were built; system tools and libraries came from
+Alpine ${ALPINE_BRANCH} repositories. A two-line musl compatibility DSO is built
+locally so npm's glibc-linked workerd binary can run with Alpine gcompat.
+Transactions use Alpine apk-tools v2 static from ${APK_COMPAT_BRANCH} because
+the current ChromeOS kernel rejects apk v3 memfd hooks.
 
 Transport:
   crosh cross -> host ssh -> VT-2 cross-service -> Alpine chroot

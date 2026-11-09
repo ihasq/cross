@@ -17,10 +17,11 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-06.37-host-updater"
+SCRIPT_VERSION="2026-11-09.38-parallel-downloads"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
+INITIAL_DOWNLOAD_JOBS=6
 CROSS_PREFIX="${CROSS_PREFIX:-/usr/local/cross}"
 CROSS_ROOT="$CROSS_PREFIX/alpine"
 CROSS_BIN="$CROSS_PREFIX/bin"
@@ -465,6 +466,61 @@ REPOS
 
 apk_chroot() { sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static "$@"; }
 
+download_initial_packages() {
+  local package_dir="$CROSS_ROOT/tmp/cross-initial-apks"
+  local url_file="$package_dir/urls"
+  local world_backup="$CROSS_ROOT/etc/apk/world.cross-before-initial-download"
+  local url out pid status=0
+  local -a urls=() pids=() packages=()
+
+  info "Downloading initial Alpine packages (${INITIAL_DOWNLOAD_JOBS} parallel jobs)"
+  sudo mkdir -p "$package_dir"
+  sudo chown "$(id -u):$(id -g)" "$package_dir"
+
+  # apk resolves the exact signed package set; the host downloader then fetches
+  # that set concurrently. apk.static verifies every local package while adding
+  # it below, so parallelism does not weaken Alpine's signature checks.
+  apk_chroot fetch --recursive --simulate --url "$@" > "$url_file"
+  mapfile -t urls < <(awk '/^https:\/\// && !seen[$0]++' "$url_file")
+  ((${#urls[@]} > 0)) || die "apk returned no initial package URLs"
+
+  for url in "${urls[@]}"; do
+    out="$package_dir/${url%%\?*}"
+    out="$package_dir/${out##*/}"
+    fetch "$url" "$out" &
+    pids+=("$!")
+    if ((${#pids[@]} == INITIAL_DOWNLOAD_JOBS)); then
+      for pid in "${pids[@]}"; do
+        wait "$pid" || status=1
+      done
+      pids=()
+    fi
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+  done
+  ((status == 0)) || die "one or more initial package downloads failed"
+
+  for out in "$package_dir"/*.apk; do
+    [[ -s "$out" ]] || die "initial package download set is incomplete"
+    packages+=("/tmp/cross-initial-apks/${out##*/}")
+  done
+
+  # Adding local files would otherwise put every transitive dependency in
+  # /etc/apk/world. Restore the pre-install world, then record only the packages
+  # requested by Cross; the second add is offline because everything is present.
+  sudo cp -f "$CROSS_ROOT/etc/apk/world" "$world_backup"
+  if ! apk_chroot add --no-cache "${packages[@]}"; then
+    sudo cp -f "$world_backup" "$CROSS_ROOT/etc/apk/world"
+    sudo rm -rf "$package_dir"
+    return 1
+  fi
+  sudo cp -f "$world_backup" "$CROSS_ROOT/etc/apk/world"
+  apk_chroot --no-network add --no-cache "$@"
+  sudo rm -f "$world_backup"
+  sudo rm -rf "$package_dir"
+}
+
 install_alpine_packages() {
   info "Installing signed Alpine development packages"
   apk_chroot update
@@ -476,7 +532,11 @@ install_alpine_packages() {
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
   )
-  apk_chroot add --no-cache "${required[@]}"
+  if [[ -f "$CROSS_COMPLETE" ]]; then
+    apk_chroot add --no-cache "${required[@]}"
+  else
+    download_initial_packages "${required[@]}"
+  fi
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/update-ca-certificates || true
   sudo mkdir -p "$CROSS_ROOT/usr/local/bin"
   sudo ln -sfn /usr/bin/rustup-init "$CROSS_ROOT/usr/local/bin/rustup"

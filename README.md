@@ -1,19 +1,297 @@
 # Cross
 
-## Setup
+Cross provides an Alpine Linux development environment on a ChromeOS device in
+Developer Mode. It uses a chroot and a localhost-only OpenSSH service instead
+of a container, virtual machine, or mount namespace.
 
-### 0. Enable ChromeOS Developer Mode
-Disabling WPS is not neccesary.
+The ChromeOS home directory is available at the same path inside Alpine, so
+projects can be edited from ChromeOS and built with Alpine tools without being
+copied between environments.
 
-### 1. Enter VT-2 and do this
-```shell
+## What Cross installs
+
+Cross bootstraps an Alpine minirootfs with SHA-256 verification and installs
+signed development packages from the official Alpine repositories. The default
+environment includes:
+
+- Bash, Git, curl, OpenSSH, and standard GNU command-line utilities
+- GCC, binutils, musl headers, CMake, Meson, Samurai, Autoconf, Automake, and
+  Libtool
+- Rust, Cargo, rustup, rustfmt, and Clippy
+- Node.js, npm, npx, and Corepack
+- Common development libraries such as OpenSSL, zlib, SQLite, libffi, libxml2,
+  libxslt, libarchive, libssh2, and libuv
+
+Cross does not build third-party tools from source. It builds only a small
+musl compatibility DSO needed by glibc-linked `workerd` binaries used by some
+npm packages.
+
+## Requirements
+
+- A ChromeOS device in Developer Mode
+- An `x86_64` or `aarch64` processor
+- Access to VT-2 as the `chronos` user
+- `sudo`, `tar`, OpenSSH, and either curl or wget on the ChromeOS host
+- At least 1.2 GiB free under `/usr/local`
+- An internet connection to the Alpine package repositories
+
+Disabling hardware write protection is not necessary. Do not disable rootfs
+verification solely to install Cross boot autostart.
+
+## Installation
+
+### 1. Enable ChromeOS Developer Mode
+
+Developer Mode reduces ChromeOS security and may erase local data when it is
+enabled or disabled. Back up important files first and follow the instructions
+for your device.
+
+### 2. Run the installer from VT-2
+
+Enter VT-2, sign in as `chronos`, and run:
+
+```bash
 curl https://cross-sh.pages.dev/cross.sh | bash
 ```
 
-### 2. Open Crosh and do this
-```shell
+Review and accept the displayed EULA to continue. Run the installer as
+`chronos`, not as root and not inside Crosh. The installer uses `sudo` only for
+the operations that require it.
+
+The first setup downloads Alpine packages with up to six concurrent downloads,
+installs the toolchains, creates SSH keys, starts the local service, and runs a
+smoke test. A setup log is written to:
+
+```text
+~/cross-setup-YYYYMMDD-HHMMSS.log
+```
+
+### 3. Reload the shell environment
+
+Open Crosh again, or reload the existing shell profile:
+
+```bash
+source ~/.bashrc
+```
+
+Then enter the Alpine shell:
+
+```bash
 cross
 ```
 
+The prompt changes to `cross@localhost` while the interactive Alpine shell is
+active. Use `exit` to return to the ChromeOS host shell.
+
+## Usage
+
+Start an interactive shell:
+
+```bash
+cross
+```
+
+Run one Alpine command without entering a shell:
+
+```bash
+cross git --version
+cross cargo build
+cross npm test
+```
+
+Cross also installs host-side wrappers for commonly used development commands.
+After reloading `~/.bashrc`, these commands are forwarded to Alpine:
+
+```bash
+git status
+cc hello.c -o hello
+cargo run
+npm install
+```
+
+The wrappers include Git and SSH tools, the GCC/binutils toolchain, Make,
+CMake, Meson, Autotools, Rust tools, and Node.js tools. `bash`, `sh`, `curl`,
+and `wget` intentionally remain the ChromeOS host commands so the installer can
+be updated even when the Cross service is stopped.
+
+### Working directories
+
+When a command is launched from the ChromeOS home directory, Cross uses the
+same path inside Alpine. This allows commands such as `cargo run` and `npm test`
+to operate directly on the current project.
+
+Commands launched outside the home directory or Cross work directory start in
+the home directory instead. An additional writable work area is available at:
+
+```text
+/usr/local/cross/work/chronos
+```
+
+### Package management
+
+Use Alpine's package manager through `sudo` inside Cross:
+
+```bash
+cross sudo apk update
+cross sudo apk add <package>
+cross sudo apk upgrade
+```
+
+Cross uses the Alpine `apk-tools` v2 static compatibility runner because some
+ChromeOS kernels reject the file-descriptor execution mechanism used by
+`apk-tools` v3 package scripts.
+
+## How it works
+
+The command path is:
+
+```text
+Crosh command
+  -> ChromeOS host SSH client
+  -> 127.0.0.1:32222
+  -> VT-2-started sshd
+  -> forced Cross session
+  -> Alpine chroot
+```
+
+The SSH daemon listens only on `127.0.0.1` and accepts the dedicated key created
+by the installer. Arbitrary SSH forwarding is disabled. The forced session
+selects the requested Alpine tool and preserves only supported working
+directories.
+
+Cross is a chroot, not a security boundary. Processes with root access inside
+the environment can affect the mounted host home directory and the Cross
+installation.
+
+## Service management
+
+Run service-management commands from VT-2:
+
+```bash
+cross-service status
+cross-service start
+cross-service stop
+cross-service restart
+cross-service doctor
+cross-service log
+```
+
+`doctor` checks the HOME bind mount, executable and symlink behavior, SSH key
+permissions, effective sshd settings, and public-key authentication.
+
+The installer starts the service immediately. It also installs a ChromeOS
+Upstart job when `/etc/init` is writable. On ordinary verified ChromeOS systems,
+the root filesystem is read-only, so this boot job cannot be installed. That
+warning is expected: after a reboot, start Cross manually from VT-2 with:
+
+```bash
+/usr/local/cross/bin/cross-service start
+```
+
+Starting or stopping the service from browser Crosh is intentionally rejected
+because Crosh normally runs with restrictions that prevent the required mount
+and chroot operations.
+
+## Updating Cross
+
+Rerun the installer from VT-2. Updates are performed in place and preserve the
+existing Alpine installation where possible:
+
+```bash
+curl https://cross-sh.pages.dev/cross.sh | bash
+```
+
+If Cross was installed by an older release that added `bash` or `curl` wrappers,
+use the host binaries explicitly for the first update:
+
+```bash
+/usr/bin/curl https://cross-sh.pages.dev/cross.sh | /bin/bash
+```
+
+To update Alpine packages independently of Cross itself:
+
+```bash
+cross sudo apk update
+cross sudo apk upgrade
+```
+
+## Security considerations
+
+Read the EULA shown by the installer before accepting it. Important aspects of
+the design include:
+
+- Developer Mode and privileged chroot operations reduce ChromeOS security.
+- The Alpine-visible bind mount of HOME is remounted with
+  `exec,nosuid,nodev`; the original ChromeOS HOME mount is not remounted.
+- Because Cross does not use a mount namespace, host processes can also reach
+  this executable view through `/usr/local/cross/alpine`.
+- If ChromeOS blocks HOME symlinks, Cross may request a temporary symlink-policy
+  exception for the stateful partition. The exception lasts until reboot.
+- The local SSH service is restricted to loopback and key authentication, but
+  it still exposes a privileged development environment to local host
+  processes that can access its private key.
+
+Review `cross.sh` before running it and keep backups of important data.
+
+## Troubleshooting
+
+### `cross: VT-2 service unreachable`
+
+Open VT-2 and run:
+
+```bash
+/usr/local/cross/bin/cross-service start
+```
+
+If it still fails, inspect the service:
+
+```bash
+/usr/local/cross/bin/cross-service doctor
+/usr/local/cross/bin/cross-service log 120
+```
+
+### Public-key authentication fails
+
+Run `cross-service doctor` from VT-2. If the key or permission checks fail,
+rerun the installer to repair the generated configuration.
+
+### `cross` is not found
+
+Reload the shell profile or open a new Crosh window:
+
+```bash
+source ~/.bashrc
+```
+
+### Downloads or DNS resolution fail
+
+Verify that ChromeOS itself has network access, then rerun the installer. Cross
+copies a usable host DNS configuration into Alpine during setup and validates
+resolution before completing.
+
+### Boot autostart is unavailable
+
+This is normal when `/etc/init` is on the verified read-only ChromeOS root
+filesystem. Cross still starts at the end of setup. After reboot, start it from
+VT-2 rather than disabling rootfs verification.
+
+### `nvm` is unavailable
+
+`nvm` is not packaged by Alpine and is not installed by Cross. Use the Alpine
+`nodejs` and `npm` packages instead.
+
+## Installation layout
+
+| Path | Purpose |
+| --- | --- |
+| `/usr/local/cross/alpine` | Alpine root filesystem |
+| `/usr/local/cross/bin` | `cross`, service commands, and host wrappers |
+| `/usr/local/cross/cache` | Download cache |
+| `/usr/local/cross/etc` | Cross and SSH client configuration |
+| `/usr/local/cross/log` | Cross logs, including optional boot logs |
+| `/usr/local/cross/run` | Runtime client state |
+| `/usr/local/cross/work/chronos` | Additional writable development area |
+
 ## License
-Cross is CC0
+
+Cross is released under CC0.

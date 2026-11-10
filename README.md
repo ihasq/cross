@@ -35,8 +35,12 @@ npm packages.
 - At least 1.2 GiB free under `/usr/local`
 - An internet connection to the Alpine package repositories
 
-Disabling hardware write protection is not necessary. Do not disable rootfs
-verification solely to install Cross boot autostart.
+Disabling hardware write protection is not necessary. Boot autostart does,
+however, require a writable `/etc/init`. On stock ChromeOS release images the
+installer uses the official ChromeOS developer tool to disable rootfs
+verification, then asks you to reboot and run the installer a second time.
+Disabling rootfs verification weakens verified boot, can affect OS updates, and
+may require recovery media to restore the device.
 
 ## Installation
 
@@ -58,9 +62,13 @@ Review and accept the displayed EULA to continue. Run the installer as
 `chronos`, not as root and not inside Crosh. The installer uses `sudo` only for
 the operations that require it.
 
-The first setup downloads Alpine packages with up to six concurrent downloads,
-installs the toolchains, creates SSH keys, starts the local service, and runs a
-smoke test. A setup log is written to:
+If `/etc/init` is read-only, the first run disables rootfs verification and
+stops before downloading Alpine. Reboot, return to VT-2, and run the same
+command again. The second run completes installation and verifies the boot job.
+
+The completing setup run downloads Alpine packages with up to six concurrent
+downloads, installs the toolchains, creates SSH keys, starts the local service,
+and runs a smoke test. A setup log is written to:
 
 ```text
 ~/cross-setup-YYYYMMDD-HHMMSS.log
@@ -179,14 +187,11 @@ cross-service log
 `doctor` checks the HOME bind mount, executable and symlink behavior, SSH key
 permissions, effective sshd settings, and public-key authentication.
 
-The installer starts the service immediately. It also installs a ChromeOS
-Upstart job when `/etc/init` is writable. On ordinary verified ChromeOS systems,
-the root filesystem is read-only, so this boot job cannot be installed. That
-warning is expected: after a reboot, start Cross manually from VT-2 with:
-
-```bash
-/usr/local/cross/bin/cross-service start
-```
+The installer starts the service immediately and installs a ChromeOS Upstart
+job at `/etc/init/cross-service.conf`. At each boot, the job waits until the
+encrypted user home is available (normally after login), then runs
+`cross-service start`. Startup attempts and errors are recorded in
+`/usr/local/cross/log/boot.log`.
 
 Starting or stopping the service from browser Crosh is intentionally rejected
 because Crosh normally runs with restrictions that prevent the required mount
@@ -221,6 +226,9 @@ Read the EULA shown by the installer before accepting it. Important aspects of
 the design include:
 
 - Developer Mode and privileged chroot operations reduce ChromeOS security.
+- Boot autostart disables rootfs verification so it can install the required
+  Upstart job. ChromeOS updates may replace that job; rerun the installer if
+  Cross no longer starts after an update.
 - The Alpine-visible bind mount of HOME is remounted with
   `exec,nosuid,nodev`; the original ChromeOS HOME mount is not remounted.
 - Because Cross does not use a mount namespace, host processes can also reach
@@ -269,11 +277,18 @@ Verify that ChromeOS itself has network access, then rerun the installer. Cross
 copies a usable host DNS configuration into Alpine during setup and validates
 resolution before completing.
 
-### Boot autostart is unavailable
+### Setup pauses for a reboot
 
-This is normal when `/etc/init` is on the verified read-only ChromeOS root
-filesystem. Cross still starts at the end of setup. After reboot, start it from
-VT-2 rather than disabling rootfs verification.
+This is expected on a stock ChromeOS release image. The first run disables
+rootfs verification so `/etc/init` can become writable. Reboot, return to VT-2,
+and rerun the installer. If `make_dev_ssd.sh` refuses the change, follow its
+printed safety guidance and then rerun the installer.
+
+### Cross stopped autostarting after a ChromeOS update
+
+An OS update can replace the root filesystem and remove the Upstart job while
+leaving `/usr/local/cross` intact. Rerun the installer from VT-2; it repairs the
+job and preserves the existing Alpine environment where possible.
 
 ### `nvm` is unavailable
 
@@ -288,7 +303,7 @@ VT-2 rather than disabling rootfs verification.
 | `/usr/local/cross/bin` | `cross`, service commands, and host wrappers |
 | `/usr/local/cross/cache` | Download cache |
 | `/usr/local/cross/etc` | Cross and SSH client configuration |
-| `/usr/local/cross/log` | Cross logs, including optional boot logs |
+| `/usr/local/cross/log` | Cross service and boot-start logs |
 | `/usr/local/cross/run` | Runtime client state |
 | `/usr/local/cross/work/chronos` | Additional writable development area |
 

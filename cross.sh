@@ -10,14 +10,15 @@
 # execution probe fails after mount flags have been corrected.
 #
 # Run from VT-2 as chronos: bash ~/Downloads/cross.sh
-# After setup the service starts immediately. Boot autostart requires writable
-# /etc/init (ordinary verified ChromeOS does not permit installing a boot job).
+# After setup the service starts immediately and at every ChromeOS boot. On a
+# stock verified image, setup disables rootfs verification and asks for one
+# reboot before it can install the Upstart job under /etc/init.
 # Then: source ~/.bashrc; cross; cargo run; code serve-web (if installed).
 
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-09.40-upstart-permissions"
+SCRIPT_VERSION="2026-11-10.41-boot-autostart"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -42,6 +43,7 @@ CHROOT_BIN=""
 HOST_SSH_BIN=""
 ROOTFS_MOUNTED=()
 SETUP_STARTED=0
+SETUP_REBOOT_REQUIRED=0
 
 info() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -96,7 +98,13 @@ Cross is a successor project to Chromebrew. By accepting, you agree:
 5. Cross is provided "AS IS" without warranties, to the extent permitted by
    law. Alpine and other third-party software retain their own licenses.
 
-6. Acceptance authorizes the operations above. Otherwise setup will exit.
+6. Cross boot autostart requires an Upstart job under /etc/init. On a stock
+   ChromeOS release image, setup uses ChromeOS's make_dev_ssd.sh tool to disable
+   rootfs verification, then requires a reboot and a second setup run. This
+   weakens verified boot, can affect OS updates, and may require recovery media
+   to restore the device. Hardware write protection is not changed.
+
+7. Acceptance authorizes the operations above. Otherwise setup will exit.
 CROSS_EULA
   while :; do
     printf '\nDo you accept the Cross EULA? [y/n]: ' >/dev/tty
@@ -123,7 +131,10 @@ release_setup_mounts() {
 cleanup() {
   local status=$?
   release_setup_mounts
-  if (( status != 0 && SETUP_STARTED != 0 )); then
+  if (( SETUP_REBOOT_REQUIRED != 0 )); then
+    printf '\nSetup paused: reboot ChromeOS, then run cross.sh again. Log: %s\n' \
+      "$LOG_FILE" >&2
+  elif (( status != 0 && SETUP_STARTED != 0 )); then
     printf '\nSetup failed. Log: %s\n' "$LOG_FILE" >&2
   fi
 }
@@ -370,6 +381,7 @@ preflight() {
 
 reset_or_prepare_prefix() {
   info "Preparing Alpine-only prefix"
+  [[ ! -L "$CROSS_PREFIX" ]] || die "refusing symlinked Cross prefix: $CROSS_PREFIX"
   if [[ -d "$CROSS_PREFIX" && ! -f "$CROSS_MARKER" ]]; then
     if [[ -d "$CROSS_PREFIX/var/db/cross" || -d "$CROSS_PREFIX/opt/zig-0.16.0" ]] \
       || compgen -G "$CROSS_PREFIX/opt/alpine-make-*" >/dev/null; then
@@ -380,11 +392,21 @@ reset_or_prepare_prefix() {
       die "$CROSS_PREFIX exists but is not cross.sh-managed"
     fi
   fi
+  [[ ! -L "$CROSS_ETC" ]] || die "refusing symlinked Cross etc directory: $CROSS_ETC"
+  [[ ! -L "$CROSS_LOG" ]] || die "refusing symlinked Cross log directory: $CROSS_LOG"
+  [[ ! -L "$CROSS_MARKER" ]] || die "refusing symlinked Cross marker: $CROSS_MARKER"
+  [[ ! -L "$CROSS_COMPLETE" ]] || die "refusing symlinked completion marker: $CROSS_COMPLETE"
   sudo mkdir -p "$CROSS_PREFIX" "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_CACHE" \
     "$CROSS_ETC" "$CROSS_RUN" "$CROSS_LOG" "$CROSS_WORK"
-  sudo chown "$(id -u):$(id -g)" "$CROSS_PREFIX" "$CROSS_BIN" "$CROSS_CACHE" \
-    "$CROSS_RUN" "$CROSS_LOG" "$CROSS_WORK"
-  printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_MARKER"
+  # Keep the prefix and etc directory root-owned because the boot job follows
+  # paths through them as root. User-writable working directories remain below.
+  sudo chown root:root "$CROSS_PREFIX" "$CROSS_ETC" "$CROSS_LOG"
+  sudo chmod 0755 "$CROSS_PREFIX" "$CROSS_ETC" "$CROSS_LOG"
+  sudo chown "$(id -u):$(id -g)" "$CROSS_BIN" "$CROSS_CACHE" \
+    "$CROSS_RUN" "$CROSS_WORK"
+  printf '%s\n' "$SCRIPT_VERSION" | sudo tee "$CROSS_MARKER" >/dev/null
+  sudo chown root:root "$CROSS_MARKER"
+  sudo chmod 0644 "$CROSS_MARKER"
 }
 
 quiesce_existing_service() {
@@ -439,7 +461,7 @@ download_and_extract_rootfs() {
   [[ "${actual,,}" == "${expected,,}" ]] || { rm -f "$archive"; die "SHA-256 mismatch"; }
   assert_rootfs_unmounted_before_removal
   info "Extracting Alpine minirootfs $ALPINE_VERSION"
-  rm -f "$CROSS_COMPLETE"
+  sudo rm -f "$CROSS_COMPLETE"
   sudo rm -rf "$CROSS_ROOT"
   sudo mkdir -p "$CROSS_ROOT"
   sudo tar -xzf "$archive" -C "$CROSS_ROOT"
@@ -1101,9 +1123,18 @@ unmount_runtime() {
   done
 }
 
+auth_probe_error_file() {
+  if (( EUID == 0 )); then
+    printf '%s\n' "$PREFIX/etc/cross-auth-probe.log"
+  else
+    printf '%s\n' "$PREFIX/run/cross-auth-probe.log"
+  fi
+}
+
 auth_probe() {
   local remote quoted err_file status
-  err_file="$PREFIX/run/cross-auth-probe.log"
+  err_file="$(auth_probe_error_file)"
+  [[ ! -L "$err_file" ]] || die "refusing symlinked authentication log: $err_file"
   printf -v quoted '%q' "$HOST_HOME"
   remote="cross-session-v1 $quoted exec /bin/true"
   : > "$err_file"
@@ -1116,9 +1147,10 @@ auth_probe() {
 }
 
 show_auth_failure() {
+  local err_file
+  err_file="$(auth_probe_error_file)"
   echo "cross-service: localhost SSH authentication probe failed" >&2
-  [[ ! -s "$PREFIX/run/cross-auth-probe.log" ]] \
-    || sed 's/^/client: /' "$PREFIX/run/cross-auth-probe.log" >&2
+  [[ ! -s "$err_file" ]] || sed 's/^/client: /' "$err_file" >&2
   [[ ! -r "$LOG_FILE" ]] \
     || sudo tail -n 80 "$LOG_FILE" | sed 's/^/sshd: /' >&2 || true
 }
@@ -1386,18 +1418,97 @@ NVM_NOTICE
   chmod 0755 "$CROSS_BIN/nvm"
 }
 
-# Install a ChromeOS Upstart boot job only when the host's /etc/init is
-# writable. Stock verified ChromeOS keeps this on a read-only rootfs; do not
-# disable rootfs verification or remount / to force installation.
+# ChromeOS release images intentionally do not load services from the writable
+# /usr/local tree. A persistent boot service therefore needs a job in /etc/init,
+# which in turn requires rootfs verification to have been disabled. Do this
+# before downloading Alpine so the first setup pass can stop quickly and resume
+# after the required reboot.
+ensure_boot_autostart_prerequisites() {
+  local make_dev_ssd="/usr/share/vboot/bin/make_dev_ssd.sh"
+  local root_device="" root_partition="" kernel_partition=""
+
+  info "Checking ChromeOS boot autostart prerequisites"
+  have initctl \
+    || die "ChromeOS Upstart initctl is required for boot autostart"
+  if sudo test -d /etc/init && sudo test -w /etc/init; then
+    return 0
+  fi
+
+  # A developer/test image can have verity disabled while / is currently
+  # mounted read-only. Prefer a remount over rewriting its kernel configuration.
+  if sudo mount -o remount,rw / 2>/dev/null \
+      && sudo test -d /etc/init && sudo test -w /etc/init; then
+    info "Remounted the already-unverified ChromeOS rootfs read-write"
+    return 0
+  fi
+
+  [[ -x "$make_dev_ssd" ]] \
+    || die "boot autostart needs a writable /etc/init, but $make_dev_ssd is unavailable"
+  have rootdev || die "rootdev is required to identify the active ChromeOS kernel"
+  root_device="$(rootdev -s 2>/dev/null || true)"
+  if [[ "$root_device" =~ ([0-9]+)$ ]]; then
+    root_partition="${BASH_REMATCH[1]}"
+  fi
+  [[ "$root_partition" =~ ^[0-9]+$ ]] && (( root_partition > 1 )) \
+    || die "cannot identify the active ChromeOS root partition: ${root_device:-unknown}"
+  kernel_partition="$((root_partition - 1))"
+  case "$kernel_partition" in
+    2|4|6) ;;
+    *) die "refusing unexpected active ChromeOS kernel partition: $kernel_partition" ;;
+  esac
+
+  warn "Boot autostart requires disabling ChromeOS rootfs verification."
+  warn "This weakens verified boot and can affect ChromeOS updates."
+  info "Disabling rootfs verification for active kernel partition $kernel_partition"
+  if ! sudo "$make_dev_ssd" --remove_rootfs_verification \
+      --partitions "$kernel_partition"; then
+    die "could not disable rootfs verification; follow make_dev_ssd.sh's guidance and rerun cross.sh"
+  fi
+
+  SETUP_REBOOT_REQUIRED=1
+  cat <<'REBOOT_REQUIRED'
+
+ChromeOS must reboot before /etc/init becomes writable.
+
+  1. Reboot the Chromebook.
+  2. Return to VT-2 as chronos.
+  3. Run cross.sh again to finish setup and install boot autostart.
+
+Do not switch Developer Mode off; doing so may wipe local data.
+REBOOT_REQUIRED
+  exit 75
+}
+
+# Install the ChromeOS Upstart boot job after the prerequisite check has made
+# /etc/init writable. Failure is fatal: a successful Cross setup promises boot
+# autostart rather than silently degrading to manual startup.
 install_boot_autostart() {
   info "Configuring ChromeOS boot autostart"
   local job="/etc/init/cross-service.conf"
   local stored="$CROSS_ETC/cross-service.upstart.conf"
-  local helper="$CROSS_BIN/cross-boot-start"
+  local helper="$CROSS_ETC/cross-boot-start"
+  local boot_service="$CROSS_ETC/cross-service-boot"
+  local boot_log="$CROSS_LOG/boot.log"
+
+  [[ ! -L "$helper" ]] || die "refusing symlinked boot helper: $helper"
+  [[ ! -L "$boot_service" ]] || die "refusing symlinked boot service: $boot_service"
+  [[ ! -L "$stored" ]] || die "refusing symlinked stored boot job: $stored"
+  [[ ! -L "$job" ]] || die "refusing symlinked Upstart job: $job"
+
+  # Upstart runs this chain as root. Snapshot the generated service controller
+  # below the root-owned etc directory instead of executing its user-writable
+  # command in bin directly.
+  sudo install -o root -g root -m 0755 "$CROSS_BIN/cross-service" "$boot_service"
+  [[ ! -L "$boot_log" ]] || die "refusing symlinked boot log: $boot_log"
+  [[ ! -e "$boot_log" || -f "$boot_log" ]] \
+    || die "refusing non-regular boot log: $boot_log"
+  sudo touch "$boot_log"
+  sudo chown root:root "$boot_log"
+  sudo chmod 0644 "$boot_log"
 
   # The user's encrypted HOME might be absent until login. Upstart must not
   # block system startup; this small watchdog runs independently of the UI.
-  cat > "$helper" <<'BOOT_HELPER'
+  cat <<'BOOT_HELPER' | sudo tee "$helper" >/dev/null
 #!/bin/bash
 set -Eeuo pipefail
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -1410,7 +1521,7 @@ PREFIX="$(dirname -- "$SELF_DIR")"
 # bind the empty pre-login placeholder as HOME.
 while :; do
   if [[ -d "$HOST_HOME" && -f "$HOST_HOME/.bashrc" ]]; then
-    if "$PREFIX/bin/cross-service" start; then
+    if "$PREFIX/etc/cross-service-boot" start; then
       exit 0
     fi
     echo "cross-boot-start: start failed; retrying after 15 seconds" >&2
@@ -1420,36 +1531,34 @@ while :; do
   fi
 done
 BOOT_HELPER
-  chmod 0755 "$helper"
+  sudo chown root:root "$helper"
+  sudo chmod 0755 "$helper"
 
   cat <<UPSTART | sudo tee "$stored" >/dev/null
 # Cross Alpine SSH service. Generated by cross.sh.
-# Requires writable /etc/init; ordinary ChromeOS verified rootfs is read-only.
+# Installed after setup has made /etc/init writable.
 description "Cross Alpine localhost SSH autostart"
 start on started system-services
 stop on stopping system-services
 task
 script
-  exec $(printf '%q' "$helper") >> $(printf '%q' "$CROSS_LOG/boot.log") 2>&1
+  exec $(printf '%q' "$helper") >> $(printf '%q' "$boot_log") 2>&1
 end script
 UPSTART
   sudo chown root:root "$stored"
   sudo chmod 0644 "$stored"
 
-  if [[ -e "$job" && ! -f "$CROSS_ETC/.upstart-installed" ]]; then
-    warn "Existing $job is not cross-managed; boot autostart not modified"
-    return 0
+  if [[ -e "$job" ]] \
+      && ! sudo grep -Fqx '# Cross Alpine SSH service. Generated by cross.sh.' "$job"; then
+    die "existing $job is not Cross-managed; move it aside and rerun cross.sh"
   fi
-  if sudo test -d /etc/init && sudo test -w /etc/init; then
-    sudo install -o root -g root -m 0644 "$stored" "$job"
-    sudo touch "$CROSS_ETC/.upstart-installed"
-    sudo initctl reload-configuration 2>/dev/null || true
-    info "Boot autostart installed: $job (starts after HOME is unlocked)"
-  else
-    warn "Boot autostart unavailable: /etc/init is read-only."
-    warn "Cross will start after setup, but not automatically at reboot."
-    warn "Do not disable ChromeOS rootfs verification merely to enable autostart."
-  fi
+  sudo test -d /etc/init && sudo test -w /etc/init \
+    || die "cannot install boot autostart because /etc/init is not writable; reboot and rerun cross.sh"
+  sudo install -o root -g root -m 0644 "$stored" "$job"
+  sudo cmp -s "$stored" "$job" || die "boot autostart job verification failed: $job"
+  sudo initctl reload-configuration \
+    || die "Upstart rejected $job; inspect it and rerun cross.sh"
+  info "Boot autostart installed: $job (starts after HOME is unlocked)"
 }
 
 write_profile() {
@@ -1569,6 +1678,7 @@ main() {
   enable_logging
   SETUP_STARTED=1
   preflight
+  ensure_boot_autostart_prerequisites
   reset_or_prepare_prefix
   quiesce_existing_service
   download_and_extract_rootfs
@@ -1587,7 +1697,9 @@ main() {
 
   validate_dns
   validate
-  printf '%s\n' "$SCRIPT_VERSION" > "$CROSS_COMPLETE"
+  printf '%s\n' "$SCRIPT_VERSION" | sudo tee "$CROSS_COMPLETE" >/dev/null
+  sudo chown root:root "$CROSS_COMPLETE"
+  sudo chmod 0644 "$CROSS_COMPLETE"
 
   info "Setup complete"
   cat <<SUMMARY
@@ -1605,10 +1717,10 @@ Activate wrappers:
   source ~/.bashrc
 
 Boot autostart:
-  An Upstart boot job is installed when /etc/init is writable. It starts Cross
-  once the encrypted HOME is available (normally after ChromeOS login).
-  On verified read-only ChromeOS, boot job installation is not possible;
-  setup still starts cross-service immediately, and VT-2 manual start works.
+  An Upstart boot job starts Cross once the encrypted HOME is available
+  (normally after ChromeOS login). On a stock release image, the first setup
+  pass disables rootfs verification and asks for a reboot; the second pass
+  installs and verifies the job.
 
 Service management from VT-2:
   cross-service status

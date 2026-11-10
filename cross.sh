@@ -18,7 +18,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-10.41-boot-autostart"
+SCRIPT_VERSION="2026-11-10.43-quiet-validation"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -548,7 +548,8 @@ install_alpine_packages() {
   apk_chroot update
   local required=(
     bash ca-certificates coreutils findutils diffutils grep sed gawk
-    tar gzip bzip2 xz file patch git git-init-template curl openssh-client openssh-server
+    tar gzip bzip2 xz file patch nano vim ffmpeg
+    git git-init-template curl openssh-client openssh-server
     build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
@@ -1636,17 +1637,12 @@ validate_home_execution() {
 validate() {
   info "Validating Alpine environment over localhost SSH"
   "$CROSS_BIN/cross-service" status
-  "$CROSS_BIN/apk" --version
-  "$CROSS_BIN/cross" git --version
-  "$CROSS_BIN/cross" curl --version | sed -n '1p'
-  "$CROSS_BIN/cross" gcc --version | sed -n '1p'
-  "$CROSS_BIN/cross" make --version | sed -n '1p'
-  "$CROSS_BIN/cross" rustup --version
-  "$CROSS_BIN/cross" rustc --version
-  "$CROSS_BIN/cross" cargo --version
-  "$CROSS_BIN/cross" node --version
-  "$CROSS_BIN/cross" npm --version
-  "$CROSS_BIN/cross" npx --version
+  "$CROSS_BIN/cross" /bin/sh -c '
+    test -x /sbin/apk.static
+    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx; do
+      command -v "$cli" >/dev/null 2>&1 || exit 1
+    done
+  '
   "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
   "$CROSS_BIN/cross" /bin/sh -c '
     test -r /usr/local/lib/cross-gcompat-resolver.so

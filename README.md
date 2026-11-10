@@ -14,7 +14,8 @@ Cross bootstraps an Alpine minirootfs with SHA-256 verification and installs
 signed development packages from the official Alpine repositories. The default
 environment includes:
 
-- Bash, Git, curl, OpenSSH, and standard GNU command-line utilities
+- Bash, Git, curl, OpenSSH, Nano, Vim, FFmpeg, and standard GNU command-line
+  utilities
 - GCC, binutils, musl headers, CMake, Meson, Samurai, Autoconf, Automake, and
   Libtool
 - Rust, Cargo, rustup, rustfmt, and Clippy

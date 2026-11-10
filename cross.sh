@@ -10,15 +10,16 @@
 # execution probe fails after mount flags have been corrected.
 #
 # Run from VT-2 as chronos: bash ~/Downloads/cross.sh
-# After setup the service starts immediately and at every ChromeOS boot. On a
-# stock verified image, setup disables rootfs verification and asks for one
-# reboot before it can install the Upstart job under /etc/init.
+# After setup the service starts immediately and, when supported, at every
+# ChromeOS boot. On a stock verified image, setup disables rootfs verification;
+# a post-reboot rerun installs the Upstart job under /etc/init. If unavailable,
+# setup completes with manual startup after reboot.
 # Then: source ~/.bashrc; cross; cargo run; code serve-web (if installed).
 
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-10.43-quiet-validation"
+SCRIPT_VERSION="2026-11-10.44-optional-autostart"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -43,7 +44,7 @@ CHROOT_BIN=""
 HOST_SSH_BIN=""
 ROOTFS_MOUNTED=()
 SETUP_STARTED=0
-SETUP_REBOOT_REQUIRED=0
+BOOT_AUTOSTART_AVAILABLE=0
 
 info() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -100,9 +101,10 @@ Cross is a successor project to Chromebrew. By accepting, you agree:
 
 6. Cross boot autostart requires an Upstart job under /etc/init. On a stock
    ChromeOS release image, setup uses ChromeOS's make_dev_ssd.sh tool to disable
-   rootfs verification, then requires a reboot and a second setup run. This
-   weakens verified boot, can affect OS updates, and may require recovery media
-   to restore the device. Hardware write protection is not changed.
+   rootfs verification, then requires a reboot and a second setup run only to
+   add autostart. This weakens verified boot, can affect OS updates, and may
+   require recovery media to restore the device. Hardware write protection is
+   not changed. Cross setup continues if autostart cannot be configured safely.
 
 7. Acceptance authorizes the operations above. Otherwise setup will exit.
 CROSS_EULA
@@ -131,10 +133,7 @@ release_setup_mounts() {
 cleanup() {
   local status=$?
   release_setup_mounts
-  if (( SETUP_REBOOT_REQUIRED != 0 )); then
-    printf '\nSetup paused: reboot ChromeOS, then run cross.sh again. Log: %s\n' \
-      "$LOG_FILE" >&2
-  elif (( status != 0 && SETUP_STARTED != 0 )); then
+  if (( status != 0 && SETUP_STARTED != 0 )); then
     printf '\nSetup failed. Log: %s\n' "$LOG_FILE" >&2
   fi
 }
@@ -1421,17 +1420,21 @@ NVM_NOTICE
 
 # ChromeOS release images intentionally do not load services from the writable
 # /usr/local tree. A persistent boot service therefore needs a job in /etc/init,
-# which in turn requires rootfs verification to have been disabled. Do this
-# before downloading Alpine so the first setup pass can stop quickly and resume
-# after the required reboot.
+# which in turn requires rootfs verification to have been disabled. Autostart is
+# optional: inability to configure it must not prevent the Alpine setup.
 ensure_boot_autostart_prerequisites() {
   local make_dev_ssd="/usr/share/vboot/bin/make_dev_ssd.sh"
   local root_device="" root_partition="" kernel_partition=""
 
   info "Checking ChromeOS boot autostart prerequisites"
-  have initctl \
-    || die "ChromeOS Upstart initctl is required for boot autostart"
+  BOOT_AUTOSTART_AVAILABLE=0
+  if ! have initctl; then
+    warn "Boot autostart unavailable: ChromeOS Upstart initctl was not found."
+    warn "Continuing setup without boot autostart."
+    return 0
+  fi
   if sudo test -d /etc/init && sudo test -w /etc/init; then
+    BOOT_AUTOSTART_AVAILABLE=1
     return 0
   fi
 
@@ -1440,22 +1443,37 @@ ensure_boot_autostart_prerequisites() {
   if sudo mount -o remount,rw / 2>/dev/null \
       && sudo test -d /etc/init && sudo test -w /etc/init; then
     info "Remounted the already-unverified ChromeOS rootfs read-write"
+    BOOT_AUTOSTART_AVAILABLE=1
     return 0
   fi
 
-  [[ -x "$make_dev_ssd" ]] \
-    || die "boot autostart needs a writable /etc/init, but $make_dev_ssd is unavailable"
-  have rootdev || die "rootdev is required to identify the active ChromeOS kernel"
+  if [[ ! -x "$make_dev_ssd" ]]; then
+    warn "Boot autostart unavailable: /etc/init is read-only and $make_dev_ssd was not found."
+    warn "Continuing setup without boot autostart."
+    return 0
+  fi
+  if ! have rootdev; then
+    warn "Boot autostart unavailable: rootdev was not found."
+    warn "Continuing setup without boot autostart."
+    return 0
+  fi
   root_device="$(rootdev -s 2>/dev/null || true)"
   if [[ "$root_device" =~ ([0-9]+)$ ]]; then
     root_partition="${BASH_REMATCH[1]}"
   fi
-  [[ "$root_partition" =~ ^[0-9]+$ ]] && (( root_partition > 1 )) \
-    || die "cannot identify the active ChromeOS root partition: ${root_device:-unknown}"
+  if [[ ! "$root_partition" =~ ^[0-9]+$ ]] || (( root_partition <= 1 )); then
+    warn "Boot autostart unavailable: cannot identify the active ChromeOS root partition (${root_device:-unknown})."
+    warn "Continuing setup without boot autostart."
+    return 0
+  fi
   kernel_partition="$((root_partition - 1))"
   case "$kernel_partition" in
     2|4|6) ;;
-    *) die "refusing unexpected active ChromeOS kernel partition: $kernel_partition" ;;
+    *)
+      warn "Boot autostart unavailable: unexpected active ChromeOS kernel partition $kernel_partition."
+      warn "Continuing setup without boot autostart."
+      return 0
+      ;;
   esac
 
   warn "Boot autostart requires disabling ChromeOS rootfs verification."
@@ -1463,26 +1481,31 @@ ensure_boot_autostart_prerequisites() {
   info "Disabling rootfs verification for active kernel partition $kernel_partition"
   if ! sudo "$make_dev_ssd" --remove_rootfs_verification \
       --partitions "$kernel_partition"; then
-    die "could not disable rootfs verification; follow make_dev_ssd.sh's guidance and rerun cross.sh"
+    warn "Boot autostart unavailable: could not disable rootfs verification."
+    warn "Continuing setup without boot autostart; follow make_dev_ssd.sh's guidance to enable it later."
+    return 0
   fi
 
-  SETUP_REBOOT_REQUIRED=1
   cat <<'REBOOT_REQUIRED'
 
-ChromeOS must reboot before /etc/init becomes writable.
+ChromeOS must reboot before /etc/init becomes writable, but Cross setup will
+continue now without boot autostart.
 
-  1. Reboot the Chromebook.
+After this setup completes:
+
+  1. Reboot the Chromebook when convenient.
   2. Return to VT-2 as chronos.
-  3. Run cross.sh again to finish setup and install boot autostart.
+  3. Run cross.sh again to install boot autostart.
 
 Do not switch Developer Mode off; doing so may wipe local data.
 REBOOT_REQUIRED
-  exit 75
+  warn "Continuing setup without boot autostart until the post-reboot rerun."
+  return 0
 }
 
 # Install the ChromeOS Upstart boot job after the prerequisite check has made
-# /etc/init writable. Failure is fatal: a successful Cross setup promises boot
-# autostart rather than silently degrading to manual startup.
+# /etc/init writable. Any failure is reported to the caller so setup can fall
+# back to manual service startup.
 install_boot_autostart() {
   info "Configuring ChromeOS boot autostart"
   local job="/etc/init/cross-service.conf"
@@ -1491,25 +1514,33 @@ install_boot_autostart() {
   local boot_service="$CROSS_ETC/cross-service-boot"
   local boot_log="$CROSS_LOG/boot.log"
 
-  [[ ! -L "$helper" ]] || die "refusing symlinked boot helper: $helper"
-  [[ ! -L "$boot_service" ]] || die "refusing symlinked boot service: $boot_service"
-  [[ ! -L "$stored" ]] || die "refusing symlinked stored boot job: $stored"
-  [[ ! -L "$job" ]] || die "refusing symlinked Upstart job: $job"
+  if [[ -L "$helper" || -L "$boot_service" || -L "$stored" || -L "$job" ]]; then
+    warn "Boot autostart not installed: a protected autostart path is a symlink."
+    return 1
+  fi
 
   # Upstart runs this chain as root. Snapshot the generated service controller
   # below the root-owned etc directory instead of executing its user-writable
   # command in bin directly.
-  sudo install -o root -g root -m 0755 "$CROSS_BIN/cross-service" "$boot_service"
-  [[ ! -L "$boot_log" ]] || die "refusing symlinked boot log: $boot_log"
-  [[ ! -e "$boot_log" || -f "$boot_log" ]] \
-    || die "refusing non-regular boot log: $boot_log"
-  sudo touch "$boot_log"
-  sudo chown root:root "$boot_log"
-  sudo chmod 0644 "$boot_log"
+  if ! sudo install -o root -g root -m 0755 \
+      "$CROSS_BIN/cross-service" "$boot_service"; then
+    warn "Boot autostart not installed: could not secure the boot service."
+    return 1
+  fi
+  if [[ -L "$boot_log" || ( -e "$boot_log" && ! -f "$boot_log" ) ]]; then
+    warn "Boot autostart not installed: refusing unsafe boot log $boot_log."
+    return 1
+  fi
+  if ! sudo touch "$boot_log" \
+      || ! sudo chown root:root "$boot_log" \
+      || ! sudo chmod 0644 "$boot_log"; then
+    warn "Boot autostart not installed: could not secure $boot_log."
+    return 1
+  fi
 
   # The user's encrypted HOME might be absent until login. Upstart must not
   # block system startup; this small watchdog runs independently of the UI.
-  cat <<'BOOT_HELPER' | sudo tee "$helper" >/dev/null
+  if ! cat <<'BOOT_HELPER' | sudo tee "$helper" >/dev/null; then
 #!/bin/bash
 set -Eeuo pipefail
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -1532,10 +1563,15 @@ while :; do
   fi
 done
 BOOT_HELPER
-  sudo chown root:root "$helper"
-  sudo chmod 0755 "$helper"
+    warn "Boot autostart not installed: could not write $helper."
+    return 1
+  fi
+  if ! sudo chown root:root "$helper" || ! sudo chmod 0755 "$helper"; then
+    warn "Boot autostart not installed: could not secure $helper."
+    return 1
+  fi
 
-  cat <<UPSTART | sudo tee "$stored" >/dev/null
+  if ! cat <<UPSTART | sudo tee "$stored" >/dev/null; then
 # Cross Alpine SSH service. Generated by cross.sh.
 # Installed after setup has made /etc/init writable.
 description "Cross Alpine localhost SSH autostart"
@@ -1546,19 +1582,32 @@ script
   exec $(printf '%q' "$helper") >> $(printf '%q' "$boot_log") 2>&1
 end script
 UPSTART
-  sudo chown root:root "$stored"
-  sudo chmod 0644 "$stored"
+    warn "Boot autostart not installed: could not write $stored."
+    return 1
+  fi
+  if ! sudo chown root:root "$stored" || ! sudo chmod 0644 "$stored"; then
+    warn "Boot autostart not installed: could not secure $stored."
+    return 1
+  fi
 
   if [[ -e "$job" ]] \
       && ! sudo grep -Fqx '# Cross Alpine SSH service. Generated by cross.sh.' "$job"; then
-    die "existing $job is not Cross-managed; move it aside and rerun cross.sh"
+    warn "Boot autostart not installed: existing $job is not Cross-managed."
+    return 1
   fi
-  sudo test -d /etc/init && sudo test -w /etc/init \
-    || die "cannot install boot autostart because /etc/init is not writable; reboot and rerun cross.sh"
-  sudo install -o root -g root -m 0644 "$stored" "$job"
-  sudo cmp -s "$stored" "$job" || die "boot autostart job verification failed: $job"
-  sudo initctl reload-configuration \
-    || die "Upstart rejected $job; inspect it and rerun cross.sh"
+  if ! sudo test -d /etc/init || ! sudo test -w /etc/init; then
+    warn "Boot autostart not installed: /etc/init is not writable."
+    return 1
+  fi
+  if ! sudo install -o root -g root -m 0644 "$stored" "$job" \
+      || ! sudo cmp -s "$stored" "$job"; then
+    warn "Boot autostart not installed: could not install or verify $job."
+    return 1
+  fi
+  if ! sudo initctl reload-configuration; then
+    warn "Boot autostart not installed: Upstart rejected $job."
+    return 1
+  fi
   info "Boot autostart installed: $job (starts after HOME is unlocked)"
 }
 
@@ -1685,7 +1734,14 @@ main() {
   configure_cross_sudo
   write_ssh_service
   write_profile
-  install_boot_autostart
+  if (( BOOT_AUTOSTART_AVAILABLE )); then
+    if ! install_boot_autostart; then
+      BOOT_AUTOSTART_AVAILABLE=0
+      warn "Continuing setup without boot autostart."
+    fi
+  else
+    warn "Boot autostart is unavailable; continuing with manual service startup."
+  fi
 
   # Set-up binds must be released before the service installs long-lived binds.
   release_setup_mounts
@@ -1713,10 +1769,9 @@ Activate wrappers:
   source ~/.bashrc
 
 Boot autostart:
-  An Upstart boot job starts Cross once the encrypted HOME is available
-  (normally after ChromeOS login). On a stock release image, the first setup
-  pass disables rootfs verification and asks for a reboot; the second pass
-  installs and verifies the job.
+  When supported, an Upstart boot job starts Cross once the encrypted HOME is
+  available (normally after ChromeOS login). If autostart could not be safely
+  configured, setup still completed; start cross-service manually after boot.
 
 Service management from VT-2:
   cross-service status

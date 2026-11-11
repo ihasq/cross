@@ -71,9 +71,10 @@ VT-2, and run the same command again to install and verify the boot job. If the
 required ChromeOS facilities are absent or reject the change, setup likewise
 continues without autostart instead of failing.
 
-The setup run downloads Alpine packages with up to six concurrent downloads,
-installs the toolchains, creates SSH keys, starts the local service, and runs a
-smoke test. A setup log is written to:
+The setup run downloads Alpine packages with up to six concurrent downloads
+and shows a per-package progress indicator, installs the toolchains, creates
+SSH keys, starts the local service, and runs a smoke test. A setup log is
+written to:
 
 ```text
 ~/cross-setup-YYYYMMDD-HHMMSS.log

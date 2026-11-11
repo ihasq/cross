@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-11.46-integrated-service-cli"
+SCRIPT_VERSION="2026-11-11.48-ascii-banner"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -50,6 +50,18 @@ info() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+show_ascii_banner() {
+  cat <<'CROSS_ASCII'
+ ▄▀▀▀▀▀▄  █▀▀▀▀▀▀▄   ▄▀▀▀▀▀▄   ▄▀▀▀▀▀▄   ▄▀▀▀▀▀▄
+▓ ▄▀▀▀▄ ▒ ▓ ░▀▀▀▄ ▓ ▓ ▄▀▀▀▄ ▓ ▓ ▄▀▀▀▄ ▓ ▓ ▄▀▀▀▄ ▓
+▒ ▒   ░▄░ ▒ ▒   ░ ░ ▒ ▒   ░ ▒ ▒ ▀▄  ▀▀▀ ▒ ▀▄  ▀▀▀
+▒ ▓       ░ ▓▒░░▀▄▀ ░ ▓   ▒ ░  ▀▄ ▀▀▀▄   ▀▄ ▀▀▀▄
+█ ▓   ▓▀▓ ▓ ░▀▀▀▀ ▓ █ █   ▓ ▓ ▄▄▄▀▀▀▄ ▓ ▄▄▄▀▀▀▄ ▓
+█ ▀▄▄▄▀ ░ ▒ ▓   ░ ░ █ ▀▄▄▄▀ ░ █ ▀▄▄▄▀ ░ █ ▀▄▄▄▀ ░
+ ▀▄▄▄▄▄▀  ░▄█   ▓▄█  ▀▄▄▄▄▄▀   ▀▄▄▄▄▄▀   ▀▄▄▄▄▄▀
+CROSS_ASCII
+}
 
 enable_logging() {
   if have tee; then
@@ -152,20 +164,34 @@ sha256_file() {
 }
 
 fetch() {
-  local url="$1" out="$2"
+  local url="$1" out="$2" progress_file="${3:-}"
   mkdir -p "$(dirname "$out")"
+  [[ -n "$progress_file" ]] && rm -f "$progress_file"
   [[ -s "$out" ]] && return 0
-  printf '\033[1;34m==>\033[0m Downloading %s\n' "${out##*/}"
+  if [[ -z "$progress_file" ]]; then
+    printf '\033[1;34m==>\033[0m Downloading %s\n' "${out##*/}"
+  fi
   rm -f "$out.part"
   case "${FETCH_TOOL##*/}" in
     curl)
-      env -u LD_LIBRARY_PATH "$FETCH_TOOL" --fail --location --show-error --silent \
-        --retry 5 --retry-delay 2 --proto '=https' --tlsv1.2 \
-        --output "$out.part" "$url"
+      if [[ -n "$progress_file" ]]; then
+        env -u LD_LIBRARY_PATH "$FETCH_TOOL" --fail --location --show-error \
+          --progress-bar --retry 5 --retry-delay 2 --proto '=https' --tlsv1.2 \
+          --output "$out.part" "$url" 2>"$progress_file"
+      else
+        env -u LD_LIBRARY_PATH "$FETCH_TOOL" --fail --location --show-error \
+          --progress-bar --retry 5 --retry-delay 2 --proto '=https' --tlsv1.2 \
+          --output "$out.part" "$url"
+      fi
       ;;
     wget)
-      env -u LD_LIBRARY_PATH "$FETCH_TOOL" --https-only --tries=5 \
-        --output-document="$out.part" "$url"
+      if [[ -n "$progress_file" ]]; then
+        env -u LD_LIBRARY_PATH "$FETCH_TOOL" --https-only --tries=5 \
+          --output-document="$out.part" "$url" 2>"$progress_file"
+      else
+        env -u LD_LIBRARY_PATH "$FETCH_TOOL" --https-only --tries=5 \
+          --output-document="$out.part" "$url"
+      fi
       ;;
     *) die "no download tool selected" ;;
   esac
@@ -257,6 +283,7 @@ bootstrap_apk_v2_runner() {
 https://dl-cdn.alpinelinux.org/alpine/${APK_COMPAT_BRANCH}/main
 REPOS
     sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
+      --progress \
       --repositories-file /etc/apk/repositories.apk2 \
       --scripts=no --commit-hooks=no add --no-cache apk-tools-static
     [[ -x "$CROSS_ROOT/sbin/apk.static" ]] || die "Alpine apk-tools v2 binary not installed"
@@ -491,14 +518,154 @@ REPOS
   bootstrap_apk_v2_runner
 }
 
-apk_chroot() { sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static "$@"; }
+apk_chroot() { sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --progress "$@"; }
+
+format_download_size() {
+  local bytes="$1"
+  if (( bytes >= 1073741824 )); then
+    printf '%d.%d GiB' "$((bytes / 1073741824))" "$(((bytes % 1073741824) * 10 / 1073741824))"
+  elif (( bytes >= 1048576 )); then
+    printf '%d.%d MiB' "$((bytes / 1048576))" "$(((bytes % 1048576) * 10 / 1048576))"
+  elif (( bytes >= 1024 )); then
+    printf '%d.%d KiB' "$((bytes / 1024))" "$(((bytes % 1024) * 10 / 1024))"
+  else
+    printf '%d B' "$bytes"
+  fi
+}
+
+# Each entry is pid|sequence|filename|progress-file|partial-file. curl and wget
+# write their own meter into separate files, and this function combines those
+# meters into stable terminal rows so parallel downloads never interleave.
+wait_for_apk_download_batch() {
+  local total="$1"
+  shift
+  local entry pid sequence name meter partial raw percent percent_value
+  local bytes size line progress_bar filled empty
+  local active tick=0 rendered=0 tty_columns=80 batch_status=0 result
+  local -a entries=("$@") results=()
+
+  if [[ -w /dev/tty ]]; then
+    tty_columns="$(stty size </dev/tty 2>/dev/null | awk '{print $2}')"
+    [[ "$tty_columns" =~ ^[0-9]+$ ]] && (( tty_columns > 0 )) || tty_columns=80
+  fi
+
+  while :; do
+    active=0
+    for entry in "${entries[@]}"; do
+      IFS='|' read -r pid sequence name meter partial <<<"$entry"
+      if kill -0 "$pid" 2>/dev/null; then
+        active=1
+        break
+      fi
+    done
+
+    [[ -w /dev/tty ]] || { (( active )) && sleep 0.25; (( active )) && continue; break; }
+    if (( rendered )); then
+      printf '\033[%dA' "${#entries[@]}" >/dev/tty
+    fi
+    for entry in "${entries[@]}"; do
+      IFS='|' read -r pid sequence name meter partial <<<"$entry"
+      raw=""
+      [[ -f "$meter" ]] && raw="$(awk 'BEGIN { RS="[\\r\\n]" } NF { line=$0 } END { print line }' "$meter")"
+      percent=""
+      if [[ "$raw" =~ ([0-9]{1,3}([.][0-9]+)?)% ]]; then
+        percent="${BASH_REMATCH[1]}%"
+        percent_value="${BASH_REMATCH[1]%%.*}"
+        percent_value=$((10#$percent_value))
+      fi
+      bytes=0
+      if [[ -f "$partial" ]]; then
+        bytes="$(wc -c <"$partial")"
+      elif [[ -f "${partial%.part}" ]]; then
+        bytes="$(wc -c <"${partial%.part}")"
+      fi
+      bytes="${bytes//[[:space:]]/}"
+      [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+      size="$(format_download_size "$bytes")"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        line="[$sequence/$total] [ finished ] $name ($size)"
+      elif [[ -n "$percent" ]]; then
+        (( percent_value > 100 )) && percent_value=100
+        filled=$((percent_value / 10))
+        empty=$((10 - filled))
+        printf -v progress_bar '%*s' "$filled" ''
+        progress_bar="${progress_bar// /#}"
+        printf -v result '%*s' "$empty" ''
+        result="${result// /-}"
+        printf -v line '[%s/%s] [%s%s] %5s %s (%s)' \
+          "$sequence" "$total" "$progress_bar" "$result" "$percent" "$name" "$size"
+      else
+        case $((tick % 4)) in
+          0) result='|' ;; 1) result='/' ;; 2) result='-' ;; *) result='\' ;;
+        esac
+        line="[$sequence/$total] [    $result    ] $name ($size)"
+      fi
+      printf '\r\033[2K%.*s\n' "$tty_columns" "$line" >/dev/tty
+    done
+    rendered=1
+    (( active )) || break
+    ((tick += 1))
+    sleep 0.25
+  done
+
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r pid sequence name meter partial <<<"$entry"
+    if wait "$pid"; then
+      results+=(0)
+    else
+      results+=(1)
+      batch_status=1
+    fi
+  done
+
+  if [[ -w /dev/tty ]]; then
+    (( rendered )) && printf '\033[%dA' "${#entries[@]}" >/dev/tty
+    local index=0
+    for entry in "${entries[@]}"; do
+      IFS='|' read -r pid sequence name meter partial <<<"$entry"
+      bytes=0
+      if [[ -f "${partial%.part}" ]]; then
+        bytes="$(wc -c <"${partial%.part}")"
+      elif [[ -f "$partial" ]]; then
+        bytes="$(wc -c <"$partial")"
+      fi
+      bytes="${bytes//[[:space:]]/}"
+      [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+      size="$(format_download_size "$bytes")"
+      if (( results[index] == 0 )); then
+        line="[$sequence/$total] [  100%   ] $name ($size)"
+      else
+        line="[$sequence/$total] [ FAILED  ] $name"
+      fi
+      printf '\r\033[2K%.*s\n' "$tty_columns" "$line" >/dev/tty
+      ((index += 1))
+    done
+  fi
+
+  if (( batch_status != 0 )); then
+    index=0
+    for entry in "${entries[@]}"; do
+      IFS='|' read -r pid sequence name meter partial <<<"$entry"
+      if (( results[index] == 0 )); then
+        ((index += 1))
+        continue
+      fi
+      if [[ -s "$meter" ]]; then
+        printf 'Download output for %s:\n' "$name" >&2
+        tr '\r' '\n' <"$meter" | tail -n 4 >&2
+      fi
+      ((index += 1))
+    done
+  fi
+  return "$batch_status"
+}
 
 download_initial_packages() {
   local package_dir="$CROSS_ROOT/tmp/cross-initial-apks"
   local url_file="$package_dir/urls"
   local world_backup="$CROSS_ROOT/etc/apk/world.cross-before-initial-download"
-  local url out pid status=0
-  local -a urls=() pids=() packages=()
+  local url out meter sequence=0 status=0
+  local -a urls=() batch=() packages=()
 
   info "Downloading initial Alpine packages (${INITIAL_DOWNLOAD_JOBS} parallel jobs)"
   sudo mkdir -p "$package_dir"
@@ -512,20 +679,20 @@ download_initial_packages() {
   ((${#urls[@]} > 0)) || die "apk returned no initial package URLs"
 
   for url in "${urls[@]}"; do
+    ((sequence += 1))
     out="$package_dir/${url%%\?*}"
     out="$package_dir/${out##*/}"
-    fetch "$url" "$out" &
-    pids+=("$!")
-    if ((${#pids[@]} == INITIAL_DOWNLOAD_JOBS)); then
-      for pid in "${pids[@]}"; do
-        wait "$pid" || status=1
-      done
-      pids=()
+    meter="$package_dir/.progress-$sequence"
+    fetch "$url" "$out" "$meter" &
+    batch+=("$!|$sequence|${out##*/}|$meter|$out.part")
+    if ((${#batch[@]} == INITIAL_DOWNLOAD_JOBS)); then
+      wait_for_apk_download_batch "${#urls[@]}" "${batch[@]}" || status=1
+      batch=()
     fi
   done
-  for pid in "${pids[@]}"; do
-    wait "$pid" || status=1
-  done
+  if ((${#batch[@]} > 0)); then
+    wait_for_apk_download_batch "${#urls[@]}" "${batch[@]}" || status=1
+  fi
   ((status == 0)) || die "one or more initial package downloads failed"
 
   for out in "$package_dir"/*.apk; do
@@ -1738,6 +1905,7 @@ C_SOURCE
 }
 
 main() {
+  show_ascii_banner
   require_vt2_eula_context
   show_eula_and_require_acceptance
   enable_logging

@@ -8,6 +8,24 @@ The ChromeOS home directory is available at the same path inside Alpine, so
 projects can be edited from ChromeOS and built with Alpine tools without being
 copied between environments.
 
+## Quickstart
+
+After enabling ChromeOS Developer Mode, open VT-2, sign in as `chronos`, and
+run the installer:
+
+```bash
+curl https://cross-sh.pages.dev/cross.sh | bash
+```
+
+Open Crosh again (or run `source ~/.bashrc`), then enter the Alpine environment:
+
+```bash
+cross
+```
+
+See [Requirements](#requirements) and [Installation](#installation) before
+installing for the security implications and complete setup instructions.
+
 ## What Cross installs
 
 Cross bootstraps an Alpine minirootfs with SHA-256 verification and installs

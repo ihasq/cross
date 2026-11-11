@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-10.44-optional-autostart"
+SCRIPT_VERSION="2026-11-11.45-validate-complete-rootfs"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -417,6 +417,7 @@ quiesce_existing_service() {
 
 rootfs_is_resumable() {
   [[ -f "$CROSS_ROOT/lib/apk/db/installed" ]] \
+    && [[ -x "$CROSS_ROOT/bin/busybox" ]] \
     && [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
     && [[ -x "$CROSS_ROOT/usr/bin/git" ]] \
     && [[ -x "$CROSS_ROOT/usr/bin/gcc" ]] \
@@ -442,13 +443,18 @@ download_and_extract_rootfs() {
   sumfile="$archive.sha256"
   version_file="$CROSS_ROOT/etc/alpine-release"
   if [[ -f "$version_file" && "$(cat "$version_file")" == "$ALPINE_VERSION" ]]; then
-    if [[ -f "$CROSS_COMPLETE" ]]; then
-      info "Alpine minirootfs $ALPINE_VERSION already installed"
+    if rootfs_is_resumable; then
+      if [[ -f "$CROSS_COMPLETE" ]]; then
+        info "Alpine minirootfs $ALPINE_VERSION already installed"
+      else
+        warn "Resuming populated but unvalidated Alpine setup"
+      fi
       return 0
     fi
-    if rootfs_is_resumable; then
-      warn "Resuming populated but unvalidated Alpine setup"
-      return 0
+    if [[ -f "$CROSS_COMPLETE" ]]; then
+      warn "Completion marker found, but required Alpine commands are missing"
+    else
+      warn "Incomplete Alpine rootfs found"
     fi
     warn "Rebuilding incomplete Alpine rootfs"
   fi

@@ -181,13 +181,17 @@ installation.
 Run service-management commands from VT-2:
 
 ```bash
-cross-service status
-cross-service start
-cross-service stop
-cross-service restart
-cross-service doctor
-cross-service log
+cross status
+cross start
+cross stop
+cross restart
+cross doctor
+cross log
 ```
+
+These are built into the `cross` command. To run an Alpine command whose name
+matches a service subcommand, put `--` before it, for example `cross -- start`.
+The former `cross-service` command remains available for compatibility.
 
 `doctor` checks the HOME bind mount, executable and symlink behavior, SSH key
 permissions, effective sshd settings, and public-key authentication.
@@ -195,9 +199,10 @@ permissions, effective sshd settings, and public-key authentication.
 The installer starts the service immediately. When supported, it also installs
 a ChromeOS Upstart job at `/etc/init/cross-service.conf`. At each boot, the job
 waits until the encrypted user home is available (normally after login), then
-runs `cross-service start`. Startup attempts and errors are recorded in
-`/usr/local/cross/log/boot.log`. If the job cannot be installed, setup completes
-and reports that the service must be started manually after reboot.
+runs the service controller used by `cross start`. Startup attempts and errors
+are recorded in `/usr/local/cross/log/boot.log`. If the job cannot be installed,
+setup completes and reports that the service must be started manually after
+reboot.
 
 Starting or stopping the service from browser Crosh is intentionally rejected
 because Crosh normally runs with restrictions that prevent the required mount
@@ -255,19 +260,19 @@ Review `cross.sh` before running it and keep backups of important data.
 Open VT-2 and run:
 
 ```bash
-/usr/local/cross/bin/cross-service start
+/usr/local/cross/bin/cross start
 ```
 
 If it still fails, inspect the service:
 
 ```bash
-/usr/local/cross/bin/cross-service doctor
-/usr/local/cross/bin/cross-service log 120
+/usr/local/cross/bin/cross doctor
+/usr/local/cross/bin/cross log 120
 ```
 
 ### Public-key authentication fails
 
-Run `cross-service doctor` from VT-2. If the key or permission checks fail,
+Run `cross doctor` from VT-2. If the key or permission checks fail,
 rerun the installer to repair the generated configuration.
 
 ### `cross` is not found
@@ -299,7 +304,7 @@ The installer treats autostart as optional. Cross is still installed and
 started at the end of setup. After a reboot, start it from VT-2 with:
 
 ```bash
-/usr/local/cross/bin/cross-service start
+/usr/local/cross/bin/cross start
 ```
 
 ### Cross stopped autostarting after a ChromeOS update
@@ -318,7 +323,7 @@ job and preserves the existing Alpine environment where possible.
 | Path | Purpose |
 | --- | --- |
 | `/usr/local/cross/alpine` | Alpine root filesystem |
-| `/usr/local/cross/bin` | `cross`, service commands, and host wrappers |
+| `/usr/local/cross/bin` | `cross`, its compatibility helpers, and host wrappers |
 | `/usr/local/cross/cache` | Download cache |
 | `/usr/local/cross/etc` | Cross and SSH client configuration |
 | `/usr/local/cross/log` | Cross service and boot-start logs |

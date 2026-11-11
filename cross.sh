@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-11.45-validate-complete-rootfs"
+SCRIPT_VERSION="2026-11-11.46-integrated-service-cli"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -889,9 +889,10 @@ CONFIG="$PREFIX/etc/cross.conf"
 
 PID_FILE="$CROSS_ROOT/run/cross-sshd.pid"
 LOG_FILE="$CROSS_ROOT/var/log/cross-sshd.log"
-info() { printf 'cross-service: %s\n' "$*"; }
-warn() { printf 'cross-service: WARN: %s\n' "$*" >&2; }
-die()  { printf 'cross-service: ERROR: %s\n' "$*" >&2; exit 1; }
+COMMAND_NAME="${CROSS_COMMAND_NAME:-cross-service}"
+info() { printf '%s: %s\n' "$COMMAND_NAME" "$*"; }
+warn() { printf '%s: WARN: %s\n' "$COMMAND_NAME" "$*" >&2; }
+die()  { printf '%s: ERROR: %s\n' "$COMMAND_NAME" "$*" >&2; exit 1; }
 
 is_mounted() {
   awk -v target="$1" '$2 == target {found=1} END {exit !found}' /proc/mounts
@@ -1155,7 +1156,7 @@ auth_probe() {
 show_auth_failure() {
   local err_file
   err_file="$(auth_probe_error_file)"
-  echo "cross-service: localhost SSH authentication probe failed" >&2
+  printf '%s: localhost SSH authentication probe failed\n' "$COMMAND_NAME" >&2
   [[ ! -s "$err_file" ]] || sed 's/^/client: /' "$err_file" >&2
   [[ ! -r "$LOG_FILE" ]] \
     || sudo tail -n 80 "$LOG_FILE" | sed 's/^/sshd: /' >&2 || true
@@ -1276,7 +1277,7 @@ case "${1:-status}" in
   status) status_service ;;
   doctor) doctor_service ;;
   log) sudo tail -n "${2:-80}" "$LOG_FILE" ;;
-  *) die "usage: cross-service {start|stop|restart|status|doctor|log [lines]}" ;;
+  *) die "usage: $COMMAND_NAME {start|stop|restart|status|doctor|log [lines]}" ;;
 esac
 SERVICE
   chmod 0755 "$CROSS_BIN/cross-service"
@@ -1292,6 +1293,19 @@ SSH_CONFIG="$PREFIX/etc/ssh/config"
 [[ -r "$CONFIG" ]] || { echo "cross: missing $CONFIG; rerun cross.sh" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$CONFIG"
+
+# Service management is part of the cross CLI. Prefixing a command with `--`
+# bypasses this dispatch, so an Alpine command with the same name remains
+# reachable (for example, `cross -- start`).
+case "${1:-}" in
+  start|stop|restart|status|doctor|log)
+    service_command="$1"
+    shift
+    export CROSS_COMMAND_NAME=cross
+    exec "$SELF_DIR/cross-service" "$service_command" "$@"
+    ;;
+esac
+
 [[ -x "$HOST_SSH_BIN" ]] || { echo "cross: host ssh unavailable: $HOST_SSH_BIN" >&2; exit 1; }
 [[ -r "$SSH_CONFIG" ]] || { echo "cross: missing SSH client configuration" >&2; exit 1; }
 
@@ -1338,13 +1352,13 @@ if (( status == 255 )); then
   if grep -Fq 'Permission denied (publickey)' "$err_file"; then
     cat >&2 <<MESSAGE
 cross: SSH public-key authentication failed.
-From VT-2: $PREFIX/bin/cross-service doctor
+From VT-2: $PREFIX/bin/cross doctor
 Rerun cross.sh if key permissions need repair.
 MESSAGE
   else
     cat >&2 <<MESSAGE
 cross: VT-2 service unreachable.
-From VT-2: $PREFIX/bin/cross-service start
+From VT-2: $PREFIX/bin/cross start
 MESSAGE
   fi
 fi
@@ -1691,7 +1705,7 @@ validate_home_execution() {
 
 validate() {
   info "Validating Alpine environment over localhost SSH"
-  "$CROSS_BIN/cross-service" status
+  "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
     for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx; do
@@ -1751,7 +1765,7 @@ main() {
 
   # Set-up binds must be released before the service installs long-lived binds.
   release_setup_mounts
-  "$CROSS_BIN/cross-service" restart
+  "$CROSS_BIN/cross" restart
 
   validate_dns
   validate
@@ -1769,7 +1783,7 @@ Transactions use Alpine apk-tools v2 static from ${APK_COMPAT_BRANCH} because
 the current ChromeOS kernel rejects apk v3 memfd hooks.
 
 Transport:
-  crosh cross -> host ssh -> VT-2 cross-service -> Alpine chroot
+  crosh cross -> host ssh -> Cross service -> Alpine chroot
 
 Activate wrappers:
   source ~/.bashrc
@@ -1777,14 +1791,14 @@ Activate wrappers:
 Boot autostart:
   When supported, an Upstart boot job starts Cross once the encrypted HOME is
   available (normally after ChromeOS login). If autostart could not be safely
-  configured, setup still completed; start cross-service manually after boot.
+  configured, setup still completed; run cross start manually after boot.
 
 Service management from VT-2:
-  cross-service status
-  cross-service start
-  cross-service stop
-  cross-service restart
-  cross-service doctor
+  cross status
+  cross start
+  cross stop
+  cross restart
+  cross doctor
 
 Examples:
   cross

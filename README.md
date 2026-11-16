@@ -167,12 +167,14 @@ Mousepad, MuPDF, or PCManFM on the browser canvas. `open -a APPLICATION`
 selects an Alpine GUI command explicitly. Running `open` without arguments
 starts Cross Desktop and opens its canvas.
 
-### Cross Desktop
+### GUI applications
 
-Start the browser canvas from Crosh:
+Run GUI applications directly from Crosh. The command starts the application
+in its browser canvas and opens the corresponding Chrome page:
 
 ```bash
-cross_desktop
+vlc ~/Downloads/movie.mp4
+gimp ~/Downloads/image.png
 ```
 
 Each application keeps its own stable random UUID and dedicated Xpra session.
@@ -192,11 +194,11 @@ be installed as distinct Chrome PWAs. UUID assignments persist across restarts.
 Cross also restores each registered application's most recent launch command
 when its service restarts, keeping installed PWA origins usable after reboot.
 
-Run VLC, optionally opening a file from the shared ChromeOS home directory:
+Run VLC with or without a file from the shared ChromeOS home directory:
 
 ```bash
-cross_desktop vlc
-cross_desktop vlc ~/Downloads/movie.mp4
+vlc
+vlc ~/Downloads/movie.mp4
 ```
 
 Run GIMP 3 in its own application-branded PWA. GIMP uses its default
@@ -204,29 +206,30 @@ single-window interface and Cross suppresses the startup splash and first-run
 welcome dialog so the editor becomes the page window directly:
 
 ```bash
-cross_desktop gimp
-cross_desktop gimp ~/Downloads/image.png
+gimp
+gimp ~/Downloads/image.png
 open -a gimp ~/Downloads/image.png
 ```
 
 GIMP receives the shared ChromeOS path directly. Its UUID, configuration,
 recent launch and PWA icon persist like the other Cross applications.
 
-Other Alpine GUI applications can be started with either form:
+Other Alpine GUI applications can be started through `open` or the namespaced
+desktop control:
 
 ```bash
-cross_desktop run xterm
-cross_desktop -- my-gui-program --flag
+open -a xterm
+cross desktop run my-gui-program --flag
 ```
 
 Desktop session controls are:
 
 ```bash
-cross_desktop status
-cross_desktop stop
-cross_desktop restart
-cross_desktop log
-cross_desktop url
+cross desktop status
+cross desktop stop
+cross desktop restart
+cross desktop log
+cross desktop url
 ```
 
 Dragging files from ChromeOS onto an application page uploads them to that
@@ -425,13 +428,13 @@ resolution before completing.
 Check the canvas service and its Xpra/PulseAudio log:
 
 ```bash
-cross_desktop status
-cross_desktop log 120
+cross desktop status
+cross desktop log 120
 ```
 
 If the main Cross service is stopped, start it from VT-2 first. Chrome may
 require one click in the canvas before it allows audio playback or clipboard
-access. `cross_desktop restart` recreates the virtual display and its private
+access. `cross desktop restart` recreates the virtual display and its private
 PulseAudio server.
 
 ### Boot autostart requires a reboot and rerun

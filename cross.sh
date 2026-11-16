@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.54-gimp"
+SCRIPT_VERSION="2026-11-16.55-direct-gui"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1323,7 +1323,7 @@ ROUTER_PID_FILE="$XDG_RUNTIME_DIR/cross-desktop-router.pid"
 ROUTER_LOG="$STATE_DIR/router.log"
 SOCKET_DIR="$XDG_RUNTIME_DIR/xpra"
 
-die() { printf 'cross_desktop: ERROR: %s\n' "$*" >&2; exit 1; }
+die() { printf 'cross desktop: ERROR: %s\n' "$*" >&2; exit 1; }
 pid_running() {
   local pid=$1 state
   kill -0 "$pid" 2>/dev/null || return 1
@@ -1707,8 +1707,10 @@ DESKTOP
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
-  sudo ln -sfn /usr/local/libexec/cross-desktop \
-    "$CROSS_ROOT/usr/local/bin/cross_desktop"
+  # The application router is an internal service. GUI applications are
+  # exposed as normal Crosh commands instead of a cross_desktop command.
+  sudo rm -f "$CROSS_ROOT/usr/local/bin/cross_desktop" \
+    "$CROSS_ROOT/usr/local/bin/cross-desktop"
 }
 
 write_ssh_service() {
@@ -2255,7 +2257,7 @@ show_auth_failure() {
 start_desktop_service() {
   if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/su-exec chronos \
       /usr/local/libexec/cross-desktop start; then
-    warn "Cross Desktop did not start; inspect it with: cross_desktop log 120"
+    warn "Cross Desktop did not start; inspect it with: cross desktop log 120"
     return 1
   fi
 }
@@ -2398,6 +2400,15 @@ SSH_CONFIG="$PREFIX/etc/ssh/config"
 # bypasses this dispatch, so an Alpine command with the same name remains
 # reachable (for example, `cross -- start`).
 case "${1:-}" in
+  desktop)
+    shift
+    exec "$SELF_DIR/cross-gui" "$@"
+    ;;
+  vlc|gimp)
+    application=$1
+    shift
+    exec "$SELF_DIR/$application" "$@"
+    ;;
   start|stop|restart|status|doctor|log)
     service_command="$1"
     shift
@@ -2494,27 +2505,24 @@ fi
 OPEN_URL_CLIENT
   chmod 0755 "$CROSS_BIN/cross-open-url"
 
-  cat > "$CROSS_BIN/cross_desktop" <<'DESKTOP_CLIENT'
+  cat > "$CROSS_BIN/cross-gui" <<'GUI_CLIENT'
 #!/bin/bash
 set -Eeuo pipefail
 
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PREFIX="$(dirname -- "$SELF_DIR")"
 CONFIG="$PREFIX/etc/cross.conf"
-[[ -r "$CONFIG" ]] || { echo "cross_desktop: missing $CONFIG; rerun cross.sh" >&2; exit 1; }
+[[ -r "$CONFIG" ]] || { echo "cross: missing $CONFIG; rerun cross.sh" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$CONFIG"
 
 usage() {
   cat <<'USAGE'
-usage: cross_desktop [start|stop|restart|status|url|log [lines]]
-       cross_desktop vlc [file ...]
-       cross_desktop gimp [image ...]
-       cross_desktop open TARGET [TARGET ...]
-       cross_desktop run COMMAND [ARG ...]
-       cross_desktop -- COMMAND [ARG ...]
+usage: cross desktop [start|stop|restart|status|url|log [lines]]
+       cross desktop run COMMAND [ARG ...]
+       cross desktop open TARGET [TARGET ...]
 
-With no arguments, starts Cross Desktop and opens its ChromeOS URL.
+Run VLC and GIMP directly with `vlc` and `gimp`.
 USAGE
 }
 
@@ -2553,21 +2561,31 @@ case "$command_name" in
   log)
     exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
     ;;
-  vlc|gimp|run|open)
-    run_and_open "$@"
-    ;;
-  --)
+  run|open)
     shift
     (( $# > 0 )) || { usage >&2; exit 2; }
-    run_and_open run "$@"
+    run_and_open "$command_name" "$@"
     ;;
   *)
-    run_and_open run "$@"
+    usage >&2
+    exit 2
     ;;
 esac
-DESKTOP_CLIENT
-  chmod 0755 "$CROSS_BIN/cross_desktop"
-  ln -sfn cross_desktop "$CROSS_BIN/cross-desktop"
+GUI_CLIENT
+  chmod 0755 "$CROSS_BIN/cross-gui"
+
+  local gui_command gui_path
+  for gui_command in vlc gimp; do
+    gui_path="/usr/bin/$gui_command"
+    cat > "$CROSS_BIN/$gui_command" <<GUI_WRAPPER
+#!/bin/sh
+exec "$CROSS_BIN/cross-gui" run "$gui_path" "\$@"
+GUI_WRAPPER
+    chmod 0755 "$CROSS_BIN/$gui_command"
+  done
+
+  # Remove the retired public command and its historical hyphenated alias.
+  rm -f "$CROSS_BIN/cross_desktop" "$CROSS_BIN/cross-desktop"
 
   cat > "$CROSS_BIN/open" <<'OPEN_CLIENT'
 #!/bin/bash
@@ -2585,7 +2603,7 @@ USAGE
 }
 
 if (( $# == 0 )); then
-  exec "$SELF_DIR/cross_desktop"
+  exec "$SELF_DIR/cross-gui" start
 fi
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -2594,12 +2612,12 @@ case "${1:-}" in
     (( $# > 0 )) || { echo 'open: -a requires an application command' >&2; exit 2; }
     application=$1
     shift
-    exec "$SELF_DIR/cross_desktop" -- "$application" "$@"
+    exec "$SELF_DIR/cross-gui" run "$application" "$@"
     ;;
   --) shift ;;
   -*) echo "open: unknown option: $1" >&2; usage >&2; exit 2 ;;
 esac
-(( $# > 0 )) || exec "$SELF_DIR/cross_desktop"
+(( $# > 0 )) || exec "$SELF_DIR/cross-gui" start
 
 status=0
 declare -a desktop_targets=()
@@ -2612,7 +2630,7 @@ for target in "$@"; do
   esac
 done
 if (( ${#desktop_targets[@]} > 0 )); then
-  "$SELF_DIR/cross_desktop" open "${desktop_targets[@]}" || status=$?
+  "$SELF_DIR/cross-gui" open "${desktop_targets[@]}" || status=$?
 fi
 exit "$status"
 OPEN_CLIENT
@@ -2988,16 +3006,25 @@ C_SOURCE
   "$CROSS_BIN/cross" /bin/sh -c "cd '$testdir' && cc hello.c -o hello && ./hello"
   rm -rf "$testdir"
 
-  info "Validating Cross Desktop, browser canvas, and VLC"
+  info "Validating direct GUI commands and browser canvas"
+  [[ -x "$CROSS_BIN/cross-gui" && -x "$CROSS_BIN/vlc" && -x "$CROSS_BIN/gimp" ]] \
+    || die "direct GUI command wrappers are missing"
+  [[ ! -e "$CROSS_BIN/cross_desktop" && ! -L "$CROSS_BIN/cross_desktop" && \
+     ! -e "$CROSS_BIN/cross-desktop" && ! -L "$CROSS_BIN/cross-desktop" ]] \
+    || die "retired cross_desktop command is still installed"
   desktop_url="$("$CROSS_BIN/cross" /usr/local/libexec/cross-desktop start | tail -n 1)"
   [[ "$desktop_url" =~ ^http://cross-[0-9a-f-]+[.]localhost:$CROSS_DESKTOP_PORT$ ]] \
     || die "Cross Desktop returned an invalid application URL: $desktop_url"
   desktop_host="${desktop_url#http://}"
-  "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop status
+  "$CROSS_BIN/cross" desktop status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /usr/bin/vlc
     test -x /usr/bin/gimp
     test -x /usr/local/libexec/cross-gimp
+    test ! -e /usr/local/bin/cross_desktop
+    test ! -L /usr/local/bin/cross_desktop
+    test ! -e /usr/local/bin/cross-desktop
+    test ! -L /usr/local/bin/cross-desktop
     test -x /usr/bin/pcmanfm
     test -x /usr/bin/mousepad
     test -x /usr/bin/ristretto
@@ -3068,17 +3095,21 @@ Transport:
   crosh cross -> host ssh -> Cross service -> Alpine chroot
 
 Cross Desktop:
-  $CROSS_BIN/cross_desktop
   http://cross-{application-uuid}.localhost:${CROSS_DESKTOP_PORT}
 
   Each application keeps a stable UUID, a dedicated X11-to-canvas session and
   an application-branded PWA. Sessions support browser audio, clipboard
-  synchronization and file drag-and-drop. To start VLC:
-    cross_desktop vlc
+  synchronization and file drag-and-drop. Start applications directly:
+    vlc
+    vlc ~/Downloads/movie.mp4
 
   To start GIMP in its application-branded PWA:
-    cross_desktop gimp
-    cross_desktop gimp ~/Downloads/image.png
+    gimp
+    gimp ~/Downloads/image.png
+
+  Session controls are available under:
+    cross desktop status
+    cross desktop log 120
 
 Open URLs in ChromeOS Chrome and local targets in Cross Desktop:
   open https://example.com

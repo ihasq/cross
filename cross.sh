@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.55-direct-gui"
+SCRIPT_VERSION="2026-11-16.56-cross-desktop"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1707,10 +1707,8 @@ DESKTOP
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
-  # The application router is an internal service. GUI applications are
-  # exposed as normal Crosh commands instead of a cross_desktop command.
-  sudo rm -f "$CROSS_ROOT/usr/local/bin/cross_desktop" \
-    "$CROSS_ROOT/usr/local/bin/cross-desktop"
+  sudo ln -sfn /usr/local/libexec/cross-desktop \
+    "$CROSS_ROOT/usr/local/bin/cross_desktop"
 }
 
 write_ssh_service() {
@@ -2584,8 +2582,47 @@ GUI_WRAPPER
     chmod 0755 "$CROSS_BIN/$gui_command"
   done
 
-  # Remove the retired public command and its historical hyphenated alias.
-  rm -f "$CROSS_BIN/cross_desktop" "$CROSS_BIN/cross-desktop"
+  cat > "$CROSS_BIN/cross_desktop" <<'DESKTOP_CLIENT'
+#!/bin/bash
+set -Eeuo pipefail
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+usage() {
+  cat <<'USAGE'
+usage: cross_desktop [start|stop|restart|status|url|log [lines]]
+       cross_desktop vlc [file ...]
+       cross_desktop gimp [image ...]
+       cross_desktop open TARGET [TARGET ...]
+       cross_desktop run COMMAND [ARG ...]
+       cross_desktop -- COMMAND [ARG ...]
+USAGE
+}
+
+command_name="${1:-start}"
+case "$command_name" in
+  -h|--help|help)
+    usage
+    ;;
+  vlc|gimp)
+    shift
+    exec "$SELF_DIR/$command_name" "$@"
+    ;;
+  start|stop|restart|status|url|log|open|run)
+    exec "$SELF_DIR/cross-gui" "$@"
+    ;;
+  --)
+    shift
+    (( $# > 0 )) || { usage >&2; exit 2; }
+    exec "$SELF_DIR/cross-gui" run "$@"
+    ;;
+  *)
+    exec "$SELF_DIR/cross-gui" run "$@"
+    ;;
+esac
+DESKTOP_CLIENT
+  chmod 0755 "$CROSS_BIN/cross_desktop"
+  ln -sfn cross_desktop "$CROSS_BIN/cross-desktop"
 
   cat > "$CROSS_BIN/open" <<'OPEN_CLIENT'
 #!/bin/bash
@@ -3007,24 +3044,22 @@ C_SOURCE
   rm -rf "$testdir"
 
   info "Validating direct GUI commands and browser canvas"
-  [[ -x "$CROSS_BIN/cross-gui" && -x "$CROSS_BIN/vlc" && -x "$CROSS_BIN/gimp" ]] \
+  [[ -x "$CROSS_BIN/cross-gui" && -x "$CROSS_BIN/vlc" && \
+     -x "$CROSS_BIN/gimp" && -x "$CROSS_BIN/cross_desktop" ]] \
     || die "direct GUI command wrappers are missing"
-  [[ ! -e "$CROSS_BIN/cross_desktop" && ! -L "$CROSS_BIN/cross_desktop" && \
-     ! -e "$CROSS_BIN/cross-desktop" && ! -L "$CROSS_BIN/cross-desktop" ]] \
-    || die "retired cross_desktop command is still installed"
+  [[ -L "$CROSS_BIN/cross-desktop" ]] \
+    || die "cross-desktop compatibility alias is missing"
   desktop_url="$("$CROSS_BIN/cross" /usr/local/libexec/cross-desktop start | tail -n 1)"
   [[ "$desktop_url" =~ ^http://cross-[0-9a-f-]+[.]localhost:$CROSS_DESKTOP_PORT$ ]] \
     || die "Cross Desktop returned an invalid application URL: $desktop_url"
   desktop_host="${desktop_url#http://}"
   "$CROSS_BIN/cross" desktop status
+  "$CROSS_BIN/cross_desktop" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /usr/bin/vlc
     test -x /usr/bin/gimp
     test -x /usr/local/libexec/cross-gimp
-    test ! -e /usr/local/bin/cross_desktop
-    test ! -L /usr/local/bin/cross_desktop
-    test ! -e /usr/local/bin/cross-desktop
-    test ! -L /usr/local/bin/cross-desktop
+    test -x /usr/local/bin/cross_desktop
     test -x /usr/bin/pcmanfm
     test -x /usr/bin/mousepad
     test -x /usr/bin/ristretto
@@ -3106,6 +3141,10 @@ Cross Desktop:
   To start GIMP in its application-branded PWA:
     gimp
     gimp ~/Downloads/image.png
+
+  The explicit application launcher is also available:
+    cross_desktop vlc ~/Downloads/movie.mp4
+    cross_desktop gimp ~/Downloads/image.png
 
   Session controls are available under:
     cross desktop status

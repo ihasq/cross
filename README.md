@@ -177,6 +177,15 @@ vlc ~/Downloads/movie.mp4
 gimp ~/Downloads/image.png
 ```
 
+The `cross_desktop` command is also available for explicit application launches
+and session management:
+
+```bash
+cross_desktop
+cross_desktop vlc ~/Downloads/movie.mp4
+cross_desktop gimp ~/Downloads/image.png
+```
+
 Each application keeps its own stable random UUID and dedicated Xpra session.
 All sessions are routed through the loopback-only port:
 
@@ -220,6 +229,7 @@ desktop control:
 ```bash
 open -a xterm
 cross desktop run my-gui-program --flag
+cross_desktop -- my-gui-program --flag
 ```
 
 Desktop session controls are:
@@ -231,6 +241,8 @@ cross desktop restart
 cross desktop log
 cross desktop url
 ```
+
+The equivalent `cross_desktop status|stop|restart|log|url` forms are supported.
 
 Dragging files from ChromeOS onto an application page uploads them to that
 application's Alpine session and passes the files to the application. Clipboard

@@ -175,18 +175,22 @@ Start the browser canvas from Crosh:
 cross_desktop
 ```
 
-Each installation keeps a stable random UUID and serves its GUI only on the
-loopback interface at:
+Each application keeps its own stable random UUID and dedicated Xpra session.
+All sessions are routed through the loopback-only port:
 
 ```text
 http://cross-{uuid}.localhost:32221
 ```
 
-The command prints the concrete URL and opens it through ChromeOS's
+The command prints the application's concrete URL and opens it through ChromeOS's
 `org.chromium.UrlHandlerService` system D-Bus service. Set
 `CROSS_DESKTOP_OPEN=0` to print the URL without opening a browser. The canvas
-is installable from Chrome as a PWA. The canvas server starts with the main
-Cross service, so an installed PWA remains usable after Cross boot autostart.
+fills the whole page with one application's main window; dialogs remain layered
+over that window. Each origin exposes a separate webmanifest using the
+application's name and icon, so VLC, Mousepad, XTerm and other applications can
+be installed as distinct Chrome PWAs. UUID assignments persist across restarts.
+Cross also restores each registered application's most recent launch command
+when its service restarts, keeping installed PWA origins usable after reboot.
 
 Run VLC, optionally opening a file from the shared ChromeOS home directory:
 
@@ -212,12 +216,10 @@ cross_desktop log
 cross_desktop url
 ```
 
-Dragging files from ChromeOS onto the canvas uploads them to the Alpine
-session. Recognized audio and video files are opened in VLC; other files remain
-available in `~/Downloads`. Clipboard exchange is enabled in both directions,
-subject to Chrome's clipboard permission and user-gesture rules. The browser
-toolbar also exposes upload, download, audio, clipboard, fullscreen, and
-on-screen keyboard controls.
+Dragging files from ChromeOS onto an application page uploads them to that
+application's Alpine session and passes the files to the application. Clipboard
+exchange is enabled in both directions, subject to Chrome's clipboard
+permission and user-gesture rules.
 
 ### Working directories
 
@@ -263,9 +265,10 @@ The optional GUI path is:
 
 ```text
 Chrome/PWA at cross-{uuid}.localhost:32221
-  -> localhost-only Xpra HTTP/WebSocket server
-  -> virtual X11 display :100
-  -> Alpine GUI application (for example VLC)
+  -> localhost-only UUID router
+  -> per-application Xpra HTTP/WebSocket backend
+  -> dedicated virtual X11 display
+  -> one Alpine GUI application (for example VLC)
 ```
 
 Xpra sends window updates to browser canvases and negotiates native browser
@@ -357,8 +360,9 @@ the design include:
 - The local SSH service is restricted to loopback and key authentication, but
   it still exposes a privileged development environment to local host
   processes that can access its private key.
-- Cross Desktop listens only on `127.0.0.1:32221` and requires the installation
-  UUID in the WebSocket `Host` header. The UUID isolates the browser origin; it
+- Cross Desktop listens only on `127.0.0.1:32221` and routes only registered
+  application UUIDs from the HTTP/WebSocket `Host` header. Each UUID isolates
+  the application's browser origin and PWA state; it
   is not a security boundary against other local processes, which can read or
   forge localhost traffic.
 - Enabling clipboard and file transfer exposes copied or dropped data to the
@@ -453,7 +457,7 @@ job and preserves the existing Alpine environment where possible.
 | `/usr/local/cross/alpine` | Alpine root filesystem |
 | `/usr/local/cross/bin` | `cross`, its compatibility helpers, and host wrappers |
 | `/usr/local/cross/cache` | Download cache |
-| `/usr/local/cross/etc` | Cross, desktop UUID, and SSH client configuration |
+| `/usr/local/cross/etc` | Cross, default application UUID, and SSH client configuration |
 | `/usr/local/cross/log` | Cross service and boot-start logs |
 | `/usr/local/cross/run` | Runtime client state |
 | `/usr/local/cross/work/chronos` | Additional writable development area |

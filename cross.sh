@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.52-open-command"
+SCRIPT_VERSION="2026-11-16.53-app-sessions"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -816,8 +816,9 @@ SUDOERS
 
 configure_cross_desktop() {
   info "Configuring Cross Desktop canvas service"
-  local uid host_home uuid_file www index_tmp
+  local uid host_home quoted_host_home uuid_file www index_tmp
   uid="$(id -u)"; host_home="${HOME:-/home/chronos/user}"
+  printf -v quoted_host_home '%q' "$host_home"
   uuid_file="$CROSS_ETC/desktop.uuid"
   www="$CROSS_ROOT/usr/local/share/cross-desktop/www"
 
@@ -931,8 +932,9 @@ PWA
     /<\/head>/ && !done {
       print "    <meta name=\"theme-color\" content=\"#2563eb\" />"
       print "    <link rel=\"manifest\" href=\"/manifest.webmanifest\" />"
-      print "    <link rel=\"icon\" href=\"/cross-desktop.svg\" type=\"image/svg+xml\" />"
+      print "    <link rel=\"stylesheet\" href=\"/cross-app.css\" />"
       print "    <script defer src=\"/cross-pwa.js\"></script>"
+      print "    <script defer src=\"/cross-app.js\"></script>"
       done=1
     }
     {print}
@@ -955,10 +957,228 @@ sound = true
 video = true
 offscreen = true
 reconnect = true
-floating_menu = true
+floating_menu = false
 min-quality = 20
 min-speed = 50
 SETTINGS
+  cat <<'APP_CSS' | sudo tee "$www/cross-app.css" >/dev/null
+html, body, #screen {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #101826;
+}
+#float_menu, #window_preview {
+  display: none !important;
+}
+APP_CSS
+  cat <<'APP_JS' | sudo tee "$www/cross-app.js" >/dev/null
+(() => {
+  const fitted = new Set();
+  const fitApplicationWindow = () => {
+    const xpra = globalThis.client;
+    if (!xpra || !xpra.id_to_window) return;
+    for (const [wid, remote] of Object.entries(xpra.id_to_window)) {
+      if (!remote || fitted.has(wid) || remote.tray || remote.override_redirect) continue;
+      const metadata = remote.metadata || {};
+      const type = remote.windowtype || "NORMAL";
+      if (metadata["transient-for"] || type === "DIALOG" || type === "UTILITY") continue;
+      fitted.add(wid);
+      try {
+        remote._set_decorated(false);
+        remote.set_fullscreen(true);
+      } catch (error) {
+        console.warn("Cross application window fit failed:", error);
+      }
+    }
+  };
+  addEventListener("resize", fitApplicationWindow);
+  setInterval(fitApplicationWindow, 150);
+})();
+APP_JS
+  cat <<'ROUTER' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" >/dev/null
+#!/usr/bin/python3
+import argparse
+import html
+import json
+import mimetypes
+import os
+import re
+import select
+import socket
+import socketserver
+
+HOST_RE = re.compile(r"^cross-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})[.]localhost(?::[0-9]+)?$", re.I)
+MAX_HEADER = 65536
+
+
+def response(status, content_type, body, extra_headers=()):
+    reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 502: "Bad Gateway"}.get(status, "Error")
+    headers = [
+        f"HTTP/1.1 {status} {reason}",
+        f"Content-Type: {content_type}",
+        f"Content-Length: {len(body)}",
+        "Cache-Control: no-cache",
+        "Connection: close",
+        *extra_headers,
+        "",
+        "",
+    ]
+    return "\r\n".join(headers).encode("ascii") + body
+
+
+class Router(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, address, routes_file):
+        self.routes_file = routes_file
+        super().__init__(address, Handler)
+
+    def routes(self):
+        routes = {}
+        try:
+            with open(self.routes_file, encoding="utf-8") as stream:
+                for line in stream:
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) == 6 and fields[0] and fields[1].isdigit():
+                        routes[fields[0].lower()] = {
+                            "port": int(fields[1]),
+                            "name": fields[2],
+                            "icon192": fields[3],
+                            "icon512": fields[4],
+                            "theme": fields[5],
+                        }
+        except FileNotFoundError:
+            pass
+        return routes
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def read_header(self):
+        data = bytearray()
+        self.request.settimeout(5)
+        while b"\r\n\r\n" not in data and len(data) < MAX_HEADER:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+
+    def send_error(self, status, message):
+        body = ("<!doctype html><title>Cross Desktop</title><h1>" +
+                html.escape(message) + "</h1>").encode("utf-8")
+        self.request.sendall(response(status, "text/html; charset=utf-8", body))
+
+    def serve_icon(self, route, size):
+        pathname = route["icon192" if size == 192 else "icon512"]
+        try:
+            with open(pathname, "rb") as stream:
+                body = stream.read()
+        except OSError:
+            self.send_error(404, "Application icon unavailable")
+            return
+        content_type = mimetypes.guess_type(pathname)[0] or "image/png"
+        self.request.sendall(response(200, content_type, body))
+
+    def serve_manifest(self, uuid, route):
+        name = route["name"] or "Cross Application"
+        manifest = {
+            "id": "/",
+            "name": name,
+            "short_name": name[:24],
+            "description": f"{name} on Cross Desktop",
+            "start_url": "/?sound=true&video=true&clipboard=true&file_transfer=true&floating_menu=false",
+            "scope": "/",
+            "display": "fullscreen",
+            "prefer_related_applications": False,
+            "background_color": "#101826",
+            "theme_color": route["theme"],
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            ],
+        }
+        body = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.request.sendall(response(200, "application/manifest+json; charset=utf-8", body))
+
+    def proxy(self, header, port):
+        try:
+            backend = socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            self.send_error(502, "Application session is not ready")
+            return
+        try:
+            backend.sendall(header)
+            self.request.settimeout(None)
+            backend.settimeout(None)
+            peers = [self.request, backend]
+            while peers:
+                readable, _, _ = select.select(peers, [], [], 60)
+                if not readable:
+                    continue
+                for source in readable:
+                    try:
+                        chunk = source.recv(65536)
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        return
+                    target = backend if source is self.request else self.request
+                    target.sendall(chunk)
+        finally:
+            backend.close()
+
+    def handle(self):
+        header = self.read_header()
+        try:
+            head = header.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1")
+            lines = head.split("\r\n")
+            method, target, _ = lines[0].split(" ", 2)
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.lower()] = value.strip()
+        except (UnicodeDecodeError, ValueError):
+            self.send_error(400, "Invalid HTTP request")
+            return
+        if target == "/health" and headers.get("host", "").split(":", 1)[0] in ("127.0.0.1", "localhost"):
+            self.request.sendall(response(200, "text/plain; charset=utf-8", b"ok\n"))
+            return
+        match = HOST_RE.fullmatch(headers.get("host", ""))
+        if not match:
+            self.send_error(404, "Unknown Cross application origin")
+            return
+        uuid = match.group(1).lower()
+        route = self.server.routes().get(uuid)
+        if not route:
+            self.send_error(404, "Unknown Cross application UUID")
+            return
+        path = target.split("?", 1)[0]
+        if method in ("GET", "HEAD") and path == "/manifest.webmanifest":
+            self.serve_manifest(uuid, route)
+        elif method in ("GET", "HEAD") and path in ("/icon-192.png", "/favicon.png", "/favicon.ico"):
+            self.serve_icon(route, 192)
+        elif method in ("GET", "HEAD") and path == "/icon-512.png":
+            self.serve_icon(route, 512)
+        else:
+            self.proxy(header, route["port"])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--routes", required=True)
+    args = parser.parse_args()
+    with Router(("127.0.0.1", args.port), args.routes) as server:
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+ROUTER
   sudo chown -R root:root "$CROSS_ROOT/usr/local/share/cross-desktop"
   sudo find "$CROSS_ROOT/usr/local/share/cross-desktop" -type d -exec chmod 0755 {} +
   sudo find "$CROSS_ROOT/usr/local/share/cross-desktop" -type f -exec chmod 0644 {} +
@@ -984,37 +1204,48 @@ set -eu
 target=${1:?missing target}
 unset LD_PRELOAD
 
-case "$target" in
-  rtsp://*|rtsps://*|rtmp://*|rtmps://*|mms://*|mmsh://*|udp://*)
-    exec /usr/bin/vlc "$target"
-    ;;
-esac
-
-if [ -d "$target" ]; then
-  exec /usr/bin/pcmanfm "$target"
-fi
-[ -e "$target" ] || {
-  printf 'open: target not found: %s\n' "$target" >&2
-  exit 1
+resolve_application() {
+  case "$1" in
+    rtsp://*|rtsps://*|rtmp://*|rtmps://*|mms://*|mmsh://*|udp://*)
+      printf '%s\n' /usr/bin/vlc
+      return
+      ;;
+  esac
+  if [ -d "$1" ]; then
+    printf '%s\n' /usr/bin/pcmanfm
+    return
+  fi
+  [ -e "$1" ] || {
+    printf 'open: target not found: %s\n' "$1" >&2
+    return 1
+  }
+  mime=$(/usr/bin/file --brief --mime-type -- "$1" 2>/dev/null || true)
+  case "$mime" in
+    audio/*|video/*|application/ogg|application/x-ogg|application/x-matroska) printf '%s\n' /usr/bin/vlc ;;
+    image/*) printf '%s\n' /usr/bin/ristretto ;;
+    text/*|application/json|application/toml|application/xml|application/x-shellscript|application/yaml) printf '%s\n' /usr/bin/mousepad ;;
+    application/pdf|application/epub+zip|application/oxps|application/vnd.comicbook+zip|application/x-cbz|application/x-xps) printf '%s\n' /usr/bin/mupdf-x11 ;;
+    *) printf '%s\n' /usr/bin/xdg-open ;;
+  esac
 }
 
-mime=$(/usr/bin/file --brief --mime-type -- "$target" 2>/dev/null || true)
-case "$mime" in
-  audio/*|video/*|application/ogg|application/x-ogg|application/x-matroska)
-    exec /usr/bin/vlc --started-from-file "$target"
+if [ "$target" = --application ]; then
+  shift
+  resolve_application "${1:?missing target}"
+  exit
+fi
+
+application=$(resolve_application "$target")
+case "$application" in
+  /usr/bin/vlc)
+    case "$target" in
+  rtsp://*|rtsps://*|rtmp://*|rtmps://*|mms://*|mmsh://*|udp://*)
+        exec /usr/bin/vlc "$target"
+        ;;
+      *) exec /usr/bin/vlc --started-from-file "$target" ;;
+    esac
     ;;
-  image/*)
-    exec /usr/bin/ristretto "$target"
-    ;;
-  text/*|application/json|application/toml|application/xml|application/x-shellscript|application/yaml)
-    exec /usr/bin/mousepad "$target"
-    ;;
-  application/pdf|application/epub+zip|application/oxps|application/vnd.comicbook+zip|application/x-cbz|application/x-xps)
-    exec /usr/bin/mupdf-x11 "$target"
-    ;;
-  *)
-    exec /usr/bin/xdg-open "$target"
-    ;;
+  *) exec "$application" "$target" ;;
 esac
 OPEN_TARGET
 
@@ -1028,61 +1259,191 @@ cd -- "$cwd" 2>/dev/null || cd -- "$HOME"
 exec "$@"
 RUN_APP
 
-  cat <<DESKTOP | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-desktop" >/dev/null
+  cat <<'DESKTOP' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-desktop" >/dev/null
 #!/bin/bash
 set -Eeuo pipefail
 
-DISPLAY_NUMBER=:100
-PORT=$CROSS_DESKTOP_PORT
-UUID=$CROSS_DESKTOP_UUID
-URL=http://cross-${CROSS_DESKTOP_UUID}.localhost:${CROSS_DESKTOP_PORT}
-HOME=$(printf '%q' "$host_home")
-export HOME DISPLAY="\$DISPLAY_NUMBER" USER=chronos LOGNAME=chronos
-export XDG_RUNTIME_DIR=/run/user/$uid
-export XDG_CONFIG_HOME="\${XDG_CONFIG_HOME:-\$HOME/.config}"
-export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-\$HOME/.cache}"
-export XDG_DATA_HOME="\${XDG_DATA_HOME:-\$HOME/.local/share}"
+ROUTER_PORT=__CROSS_DESKTOP_PORT__
+DEFAULT_UUID=__CROSS_DESKTOP_UUID__
+BACKEND_PORT_BASE=32300
+DISPLAY_BASE=110
+MAX_APPLICATIONS=200
+export HOME=__CROSS_HOST_HOME__ USER=chronos LOGNAME=chronos
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 export QT_QPA_PLATFORM=xcb GDK_BACKEND=x11 SDL_VIDEODRIVER=x11
 export QT_X11_NO_MITSHM=1 LIBGL_ALWAYS_SOFTWARE=1
 unset LD_PRELOAD
 
-STATE_DIR="\$HOME/.local/state/cross-desktop"
-SOCKET_DIR="\$XDG_RUNTIME_DIR/xpra"
-PID_FILE="\$XDG_RUNTIME_DIR/cross-desktop.pid"
-LOG_FILE="\$STATE_DIR/xpra.log"
+STATE_DIR="$HOME/.local/state/cross-desktop"
+APPS_DIR="$STATE_DIR/apps"
+ROUTES_FILE="$STATE_DIR/routes.tsv"
+ROUTER_PID_FILE="$XDG_RUNTIME_DIR/cross-desktop-router.pid"
+ROUTER_LOG="$STATE_DIR/router.log"
+SOCKET_DIR="$XDG_RUNTIME_DIR/xpra"
 
-die() { printf 'cross_desktop: ERROR: %s\n' "\$*" >&2; exit 1; }
-running_pid() {
-  local pid
-  [[ -r "\$PID_FILE" ]] || return 1
-  read -r pid < "\$PID_FILE" || return 1
-  [[ "\$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "\$pid" 2>/dev/null || return 1
-  tr '\0' ' ' < "/proc/\$pid/cmdline" 2>/dev/null | grep -q '[x]pra' || return 1
-  printf '%s\n' "\$pid"
+die() { printf 'cross_desktop: ERROR: %s\n' "$*" >&2; exit 1; }
+pid_running() {
+  local pid=$1 state
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+  [[ -n "$state" && "$state" != Z ]]
+}
+valid_pid_file() {
+  local file=$1 expected=${2:-} pid command_line
+  [[ -r "$file" ]] || return 1
+  read -r pid < "$file" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  pid_running "$pid" || return 1
+  if [[ -n "$expected" ]]; then
+    command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+    [[ "$command_line" == *"$expected"* ]] || return 1
+  fi
+  printf '%s\n' "$pid"
 }
 prepare() {
-  mkdir -p "\$STATE_DIR" "\$SOCKET_DIR" "\$HOME/Downloads" \
-    "\$XDG_CONFIG_HOME" "\$XDG_CACHE_HOME" "\$XDG_DATA_HOME"
-  chmod 0700 "\$XDG_RUNTIME_DIR" "\$SOCKET_DIR"
+  mkdir -p "$STATE_DIR" "$APPS_DIR" "$SOCKET_DIR" "$HOME/Downloads" \
+    "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
+  chmod 0700 "$XDG_RUNTIME_DIR" "$SOCKET_DIR" "$APPS_DIR"
+  touch "$ROUTES_FILE"
 }
-start_server() {
+resolve_executable() {
+  local command_name=${1:?missing application command} executable
+  if [[ "$command_name" == */* ]]; then
+    [[ -x "$command_name" ]] || die "application is not executable: $command_name"
+    executable="$(readlink -f -- "$command_name")"
+  else
+    executable="$(command -v -- "$command_name" 2>/dev/null)" \
+      || die "application not found: $command_name"
+    executable="$(readlink -f -- "$executable")"
+  fi
+  printf '%s\n' "$executable"
+}
+find_desktop_file() {
+  local executable=$1 base=${1##*/} desktop exec_line
+  if [[ -r "/usr/share/applications/$base.desktop" ]]; then
+    printf '%s\n' "/usr/share/applications/$base.desktop"
+    return
+  fi
+  for desktop in /usr/share/applications/*.desktop; do
+    [[ -r "$desktop" ]] || continue
+    exec_line="$(sed -n 's/^Exec=//p' "$desktop" | head -n 1)"
+    case " $exec_line " in
+      *" $base "*|*"/$base "*) printf '%s\n' "$desktop"; return ;;
+    esac
+  done
+  return 1
+}
+find_icon() {
+  local icon_name=$1 candidate found=""
+  if [[ "$icon_name" == /* && -r "$icon_name" ]]; then
+    printf '%s\n' "$icon_name"
+    return
+  fi
+  while IFS= read -r candidate; do found=$candidate; done < <(
+    find /usr/share/icons /usr/share/pixmaps -type f \
+      \( -name "$icon_name.png" -o -name "$icon_name.svg" -o -name "$icon_name.xpm" \) \
+      2>/dev/null | sort -V
+  )
+  [[ -n "$found" ]] && printf '%s\n' "$found"
+}
+write_app_assets() {
+  local executable=$1 app_dir=$2 desktop="" name icon_name icon_path="" size
+  desktop="$(find_desktop_file "$executable" 2>/dev/null || true)"
+  name=${executable##*/}
+  icon_name=${executable##*/}
+  if [[ -n "$desktop" ]]; then
+    name="$(sed -n 's/^Name=//p' "$desktop" | head -n 1)"
+    icon_name="$(sed -n 's/^Icon=//p' "$desktop" | head -n 1)"
+  fi
+  name="$(printf '%s' "${name:-${executable##*/}}" | tr '\t\r\n' '   ')"
+  icon_path="$(find_icon "${icon_name:-${executable##*/}}" 2>/dev/null || true)"
+  for size in 192 512; do
+    if [[ -n "$icon_path" ]] && /usr/bin/ffmpeg -hide_banner -loglevel error -y \
+        -i "$icon_path" -frames:v 1 \
+        -vf "scale=$size:$size:force_original_aspect_ratio=decrease,pad=$size:$size:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba" \
+        "$app_dir/icon-$size.png"; then
+      :
+    else
+      cp "/usr/local/share/cross-desktop/www/cross-icon-$size.png" "$app_dir/icon-$size.png"
+    fi
+  done
+  printf '%s\n' "$name" > "$app_dir/name"
+  printf '%s\n' '#2563eb' > "$app_dir/theme"
+}
+ensure_app() {
+  local executable=$1 hash app_dir uuid slot used=" " probe
+  prepare
+  hash="$(printf '%s' "$executable" | sha256sum | awk '{print $1}')"
+  app_dir="$APPS_DIR/$hash"
+  exec 9>"$STATE_DIR/apps.lock"
+  flock 9
+  if [[ ! -r "$app_dir/uuid" ]]; then
+    mkdir -p "$app_dir"
+    uuid="$(tr 'A-F' 'a-f' < /proc/sys/kernel/random/uuid)"
+    [[ "$executable" != /usr/bin/xterm ]] || uuid=$DEFAULT_UUID
+    [[ "$uuid" =~ ^[0-9a-f-]{36}$ ]] || die 'could not generate application UUID'
+    for probe in "$APPS_DIR"/*/slot; do
+      [[ -r "$probe" ]] && used+="$(<"$probe") "
+    done
+    for ((slot=0; slot<MAX_APPLICATIONS; slot++)); do
+      [[ "$used" == *" $slot "* ]] || break
+    done
+    (( slot < MAX_APPLICATIONS )) || die "application session limit reached ($MAX_APPLICATIONS)"
+    printf '%s\n' "$uuid" > "$app_dir/uuid"
+    printf '%s\n' "$executable" > "$app_dir/executable"
+    printf '%s\n' "$slot" > "$app_dir/slot"
+    printf '%s\n' "$((BACKEND_PORT_BASE + slot))" > "$app_dir/port"
+    printf '%s\n' "$((DISPLAY_BASE + slot))" > "$app_dir/display"
+    write_app_assets "$executable" "$app_dir"
+    printf '#!/bin/sh\nexec %q "$@"\n' "$executable" > "$app_dir/open-file"
+    chmod 0700 "$app_dir/open-file"
+  fi
+  flock -u 9
+  printf '%s\n' "$app_dir"
+}
+app_url() {
+  printf 'http://cross-%s.localhost:%s\n' "$(<"$1/uuid")" "$ROUTER_PORT"
+}
+start_router() {
   local pid attempt
   prepare
-  if pid="\$(running_pid 2>/dev/null)"; then
-    printf 'Cross Desktop is running (pid %s).\n%s\n' "\$pid" "\$URL"
-    return 0
-  fi
-  rm -f "\$PID_FILE"
-  /usr/bin/xpra start "\$DISPLAY_NUMBER" \
+  if pid="$(valid_pid_file "$ROUTER_PID_FILE" cross-desktop-router 2>/dev/null)"; then return; fi
+  rm -f "$ROUTER_PID_FILE"
+  nohup /usr/local/libexec/cross-desktop-router \
+    --port "$ROUTER_PORT" --routes "$ROUTES_FILE" \
+    </dev/null >>"$ROUTER_LOG" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$ROUTER_PID_FILE"
+  for ((attempt=1; attempt<=50; attempt++)); do
+    if pid_running "$pid" &&
+       curl --silent --fail --max-time 1 "http://127.0.0.1:$ROUTER_PORT/health" >/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  tail -n 80 "$ROUTER_LOG" >&2 || true
+  die "application router did not become ready on 127.0.0.1:$ROUTER_PORT"
+}
+start_app_session() {
+  local app_dir=$1 pid port display name attempt
+  SESSION_STARTED=0
+  if pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null)"; then return; fi
+  rm -f "$app_dir/xpra.pid"
+  port="$(<"$app_dir/port")"
+  display="$(<"$app_dir/display")"
+  name="$(<"$app_dir/name")"
+  /usr/bin/xpra start ":$display" \
     --daemon=yes \
-    --bind-tcp="127.0.0.1:\$PORT,auth=http-header,property=Host,value=cross-\$UUID.localhost:\$PORT" \
+    --bind-tcp="127.0.0.1:$port" \
     --html=/usr/local/share/cross-desktop/www \
-    --socket-dir="\$SOCKET_DIR" \
-    --pidfile="\$PID_FILE" \
-    --log-dir="\$STATE_DIR" \
+    --socket-dir="$SOCKET_DIR" \
+    --pidfile="$app_dir/xpra.pid" \
+    --log-dir="$app_dir" \
     --log-file=xpra.log \
-    --session-name="Cross Desktop" \
+    --session-name="$name" \
     --mdns=no \
     --systemd-run=no \
     --dbus=no \
@@ -1091,7 +1452,7 @@ start_server() {
     --file-size-limit=2048 \
     --open-files=yes \
     --open-url=no \
-    --open-command=/usr/local/libexec/cross-open-file \
+    --open-command="$app_dir/open-file" \
     --printing=no \
     --webcam=no \
     --audio=yes \
@@ -1106,82 +1467,183 @@ start_server() {
     --terminate-children=yes \
     --notifications=yes
   for ((attempt=1; attempt<=80; attempt++)); do
-    if pid="\$(running_pid 2>/dev/null)" &&
-       /usr/bin/curl --silent --fail --max-time 1 "http://127.0.0.1:\$PORT/" >/dev/null; then
-      printf 'Cross Desktop started (pid %s).\n%s\n' "\$pid" "\$URL"
-      return 0
+    if pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null)" &&
+       curl --silent --fail --max-time 1 "http://127.0.0.1:$port/" >/dev/null; then
+      SESSION_STARTED=1
+      return
     fi
     sleep 0.1
   done
-  [[ ! -r "\$LOG_FILE" ]] || tail -n 80 "\$LOG_FILE" >&2
-  die "Xpra did not become ready on 127.0.0.1:\$PORT"
+  [[ ! -r "$app_dir/xpra.log" ]] || tail -n 80 "$app_dir/xpra.log" >&2
+  die "$name did not become ready on its private Xpra backend"
 }
-stop_server() {
-  local pid
-  if ! pid="\$(running_pid 2>/dev/null)"; then
-    echo 'Cross Desktop is stopped.'
-    return 0
-  fi
-  /usr/bin/xpra stop "\$DISPLAY_NUMBER" --socket-dir="\$SOCKET_DIR" >/dev/null 2>&1 || kill -TERM "\$pid" 2>/dev/null || true
-  for _ in {1..40}; do
-    kill -0 "\$pid" 2>/dev/null || break
-    sleep 0.1
+publish_routes() {
+  local temp app_dir pid
+  exec 8>"$STATE_DIR/routes.lock"
+  flock 8
+  temp="$(mktemp "$STATE_DIR/routes.XXXXXXXX")"
+  for app_dir in "$APPS_DIR"/*; do
+    [[ -d "$app_dir" ]] || continue
+    pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null || true)"
+    [[ -n "$pid" ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(<"$app_dir/uuid")" "$(<"$app_dir/port")" "$(<"$app_dir/name")" \
+      "$app_dir/icon-192.png" "$app_dir/icon-512.png" "$(<"$app_dir/theme")" >> "$temp"
   done
-  rm -f "\$PID_FILE"
-  echo 'Cross Desktop stopped.'
+  mv -f "$temp" "$ROUTES_FILE"
+  flock -u 8
+}
+ensure_app_session() {
+  local executable=$1
+  APP_DIR="$(ensure_app "$executable")"
+  start_router
+  start_app_session "$APP_DIR"
+  publish_routes
+}
+record_restore_command() {
+  local app_dir=$1; shift
+  local temporary argument
+  temporary="$app_dir/restore-app.new"
+  {
+    printf '#!/bin/bash\ncd %q 2>/dev/null || cd -- "$HOME"\nexec' "$PWD"
+    for argument in "$@"; do printf ' %q' "$argument"; done
+    printf '\n'
+  } > "$temporary"
+  chmod 0700 "$temporary"
+  mv -f "$temporary" "$app_dir/restore-app"
+}
+launch_restore_command() {
+  local app_dir=$1 display
+  [[ -x "$app_dir/restore-app" ]] || return 0
+  display="$(<"$app_dir/display")"
+  /usr/bin/xpra control --socket-dir="$SOCKET_DIR" -- ":$display" \
+    start-child "$app_dir/restore-app" >/dev/null
+}
+launch_for_app() {
+  local application_key=$1; shift
+  local executable display name
+  executable="$(resolve_executable "$application_key")"
+  ensure_app_session "$executable"
+  display="$(<"$APP_DIR/display")"
+  name="$(<"$APP_DIR/name")"
+  record_restore_command "$APP_DIR" "$@"
+  /usr/bin/xpra control --socket-dir="$SOCKET_DIR" -- ":$display" \
+    start-child /usr/local/libexec/cross-run-app "$PWD" "$@" >/dev/null
+  printf 'Started %s in its Cross application session.\n' "$name"
+  app_url "$APP_DIR"
 }
 run_app() {
-  (( \$# > 0 )) || die 'no application command supplied'
-  if [[ "\$1" == */* ]]; then
-    [[ -x "\$1" ]] || die "application is not executable: \$1"
-  else
-    command -v "\$1" >/dev/null 2>&1 || die "application not found: \$1"
-  fi
-  start_server >/dev/null
-  prepare
-  /usr/bin/xpra control --socket-dir="\$SOCKET_DIR" "\$DISPLAY_NUMBER" \
-    start-child /usr/local/libexec/cross-run-app "\$PWD" "\$@" >/dev/null
-  printf 'Started %q in Cross Desktop.\n%s\n' "\$1" "\$URL"
+  (( $# > 0 )) || die 'no application command supplied'
+  launch_for_app "$1" "$@"
 }
 open_targets() {
-  (( \$# > 0 )) || die 'no target supplied'
-  start_server >/dev/null
-  prepare
-  local target
-  for target in "\$@"; do
-    /usr/bin/xpra control --socket-dir="\$SOCKET_DIR" "\$DISPLAY_NUMBER" \
-      start-child /usr/local/libexec/cross-run-app "\$PWD" \
-      /usr/local/libexec/cross-open-target "\$target" >/dev/null
-    printf 'Opened %q in Cross Desktop.\n' "\$target"
+  (( $# > 0 )) || die 'no target supplied'
+  local target application
+  for target in "$@"; do
+    application="$(/usr/local/libexec/cross-open-target --application "$target")"
+    launch_for_app "$application" /usr/local/libexec/cross-open-target "$target"
   done
-  printf '%s\n' "\$URL"
+}
+start_server() {
+  local executable default_dir app_dir found=0
+  prepare
+  start_router
+  executable="$(resolve_executable /usr/bin/xterm)"
+  default_dir="$(ensure_app "$executable")"
+  [[ -x "$default_dir/restore-app" ]] \
+    || record_restore_command "$default_dir" /usr/bin/xterm
+  for app_dir in "$APPS_DIR"/*; do
+    [[ -d "$app_dir" && -r "$app_dir/executable" ]] || continue
+    start_app_session "$app_dir"
+    if (( SESSION_STARTED )); then launch_restore_command "$app_dir"; fi
+    ((found += 1))
+  done
+  (( found > 0 )) || die 'failed to initialize the default application session'
+  publish_routes
+  printf 'Cross application router is running on 127.0.0.1:%s.\n' "$ROUTER_PORT"
+  app_url "$default_dir"
+}
+stop_server() {
+  local app_dir pid display router_pid="" attempt
+  prepare
+  for app_dir in "$APPS_DIR"/*; do
+    [[ -d "$app_dir" ]] || continue
+    pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null || true)"
+    [[ -n "$pid" ]] || { rm -f "$app_dir/xpra.pid"; continue; }
+    display="$(<"$app_dir/display")"
+    /usr/bin/xpra stop ":$display" --socket-dir="$SOCKET_DIR" >/dev/null 2>&1 \
+      || kill -TERM "$pid" 2>/dev/null || true
+    for ((attempt=1; attempt<=50; attempt++)); do
+      pid_running "$pid" || break
+      sleep 0.1
+    done
+    pid_running "$pid" && kill -KILL "$pid" 2>/dev/null || true
+    rm -f "$app_dir/xpra.pid"
+  done
+  router_pid="$(valid_pid_file "$ROUTER_PID_FILE" cross-desktop-router 2>/dev/null || true)"
+  if [[ -n "$router_pid" ]]; then
+    kill -TERM "$router_pid" 2>/dev/null || true
+    for ((attempt=1; attempt<=50; attempt++)); do
+      pid_running "$router_pid" || break
+      sleep 0.1
+    done
+    pid_running "$router_pid" && kill -KILL "$router_pid" 2>/dev/null || true
+  fi
+  rm -f "$ROUTER_PID_FILE" "$ROUTES_FILE"
+  echo 'Cross application sessions stopped.'
+}
+show_status() {
+  local router_pid app_dir pid running=0
+  router_pid="$(valid_pid_file "$ROUTER_PID_FILE" cross-desktop-router 2>/dev/null || true)"
+  [[ -n "$router_pid" ]] || { echo 'Cross Desktop is stopped.'; return 3; }
+  printf 'Cross application router is running (pid %s, 127.0.0.1:%s).\n' "$router_pid" "$ROUTER_PORT"
+  for app_dir in "$APPS_DIR"/*; do
+    [[ -d "$app_dir" ]] || continue
+    pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null || true)"
+    [[ -n "$pid" ]] || continue
+    printf '  %s: pid %s, %s\n' "$(<"$app_dir/name")" "$pid" "$(app_url "$app_dir")"
+    ((running += 1))
+  done
+  printf '%s application session(s) running.\n' "$running"
+}
+show_logs() {
+  local lines=${1:-80} app_dir
+  [[ ! -r "$ROUTER_LOG" ]] || { echo '== router =='; tail -n "$lines" "$ROUTER_LOG"; }
+  for app_dir in "$APPS_DIR"/*; do
+    [[ -r "$app_dir/xpra.log" ]] || continue
+    printf '== %s ==\n' "$(<"$app_dir/name")"
+    tail -n "$lines" "$app_dir/xpra.log"
+  done
 }
 
-case "\${1:-start}" in
+case "${1:-start}" in
   start) shift || true; start_server ;;
   stop) shift; stop_server ;;
   restart) shift; stop_server; start_server ;;
-  status)
-    if pid="\$(running_pid 2>/dev/null)"; then
-      printf 'Cross Desktop is running (pid %s, 127.0.0.1:%s).\n%s\n' "\$pid" "\$PORT" "\$URL"
-    else
-      echo 'Cross Desktop is stopped.'
-      exit 3
-    fi
+  status) show_status ;;
+  url)
+    app_dir="$(ensure_app "$(resolve_executable /usr/bin/xterm)")"
+    app_url "$app_dir"
     ;;
-  url) printf '%s\n' "\$URL" ;;
-  log) tail -n "\${2:-80}" "\$LOG_FILE" ;;
-  run) shift; run_app "\$@" ;;
-  open) shift; open_targets "\$@" ;;
-  vlc) shift; run_app /usr/bin/vlc "\$@" ;;
-  *) run_app "\$@" ;;
+  log) show_logs "${2:-80}" ;;
+  run) shift; run_app "$@" ;;
+  open) shift; open_targets "$@" ;;
+  vlc) shift; run_app /usr/bin/vlc "$@" ;;
+  *) run_app "$@" ;;
 esac
 DESKTOP
+  sudo sed -i \
+    -e "s/__CROSS_DESKTOP_PORT__/$CROSS_DESKTOP_PORT/g" \
+    -e "s/__CROSS_DESKTOP_UUID__/$CROSS_DESKTOP_UUID/g" \
+    -e "s|__CROSS_HOST_HOME__|$quoted_host_home|g" \
+    "$CROSS_ROOT/usr/local/libexec/cross-desktop"
   sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
+    "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
   sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
+    "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
@@ -1997,38 +2459,49 @@ USAGE
 
 open_browser() {
   [[ "${CROSS_DESKTOP_OPEN:-1}" != 0 ]] || return 0
-  "$SELF_DIR/cross-open-url" "$CROSS_DESKTOP_URL"
+  "$SELF_DIR/cross-open-url" "$1"
+}
+run_and_open() {
+  local output status url
+  set +e
+  output=$("$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@")
+  status=$?
+  set -e
+  [[ -z "$output" ]] || printf '%s\n' "$output"
+  (( status == 0 )) || return "$status"
+  while IFS= read -r url; do
+    [[ -n "$url" ]] && open_browser "$url"
+  done < <(printf '%s\n' "$output" | awk '/^http:\/\/cross-[0-9a-f-]+[.]localhost:[0-9]+$/ && !seen[$0]++')
 }
 
 command_name="${1:-start}"
 case "$command_name" in
   -h|--help|help) usage; exit 0 ;;
-  start|restart)
-    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$command_name"
-    open_browser
+  start)
+    run_and_open start
+    ;;
+  restart)
+    run_and_open restart
     ;;
   stop|status)
     exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
     ;;
   url)
-    printf '%s\n' "$CROSS_DESKTOP_URL"
+    exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop url
     ;;
   log)
     exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
     ;;
   vlc|run|open)
-    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
-    open_browser
+    run_and_open "$@"
     ;;
   --)
     shift
     (( $# > 0 )) || { usage >&2; exit 2; }
-    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop run "$@"
-    open_browser
+    run_and_open run "$@"
     ;;
   *)
-    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop run "$@"
-    open_browser
+    run_and_open run "$@"
     ;;
 esac
 DESKTOP_CLIENT
@@ -2423,6 +2896,7 @@ validate_home_execution() {
 
 validate() {
   info "Validating Alpine environment over localhost SSH"
+  local testdir desktop_url desktop_host
   "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
@@ -2444,7 +2918,6 @@ validate() {
 
   validate_home_execution
 
-  local testdir
   testdir="$CROSS_WORK/chronos/.cross-smoke-test.$$"
   mkdir -p "$testdir"
   cat > "$testdir/hello.c" <<'C_SOURCE'
@@ -2455,7 +2928,10 @@ C_SOURCE
   rm -rf "$testdir"
 
   info "Validating Cross Desktop, browser canvas, and VLC"
-  "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop start
+  desktop_url="$("$CROSS_BIN/cross" /usr/local/libexec/cross-desktop start | tail -n 1)"
+  [[ "$desktop_url" =~ ^http://cross-[0-9a-f-]+[.]localhost:$CROSS_DESKTOP_PORT$ ]] \
+    || die "Cross Desktop returned an invalid application URL: $desktop_url"
+  desktop_host="${desktop_url#http://}"
   "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /usr/bin/vlc
@@ -2463,12 +2939,18 @@ C_SOURCE
     test -x /usr/bin/mousepad
     test -x /usr/bin/ristretto
     test -x /usr/bin/mupdf-x11
+    test -x /usr/local/libexec/cross-desktop-router
     test -x /usr/local/libexec/cross-open-target
     test -f /usr/local/share/cross-desktop/www/manifest.webmanifest
     test -f /usr/local/share/cross-desktop/www/sw.js
-    curl --silent --fail --max-time 3 http://127.0.0.1:'"$CROSS_DESKTOP_PORT"'/ \
-      | grep -q "Cross Desktop"
+    test -f /usr/local/share/cross-desktop/www/cross-app.js
+    test -f /usr/local/share/cross-desktop/www/cross-app.css
+    curl --silent --fail --max-time 3 -H "Host: '"$desktop_host"'" \
+      http://127.0.0.1:'"$CROSS_DESKTOP_PORT"'/manifest.webmanifest \
+      | grep -q '"name":"XTerm"'
   '
+  [[ "$("$CROSS_BIN/cross" /usr/local/libexec/cross-desktop url)" == "$desktop_url" ]] \
+    || die "Cross Desktop did not preserve the default application UUID"
 }
 
 main() {
@@ -2523,10 +3005,11 @@ Transport:
 
 Cross Desktop:
   $CROSS_BIN/cross_desktop
-  http://cross-${CROSS_DESKTOP_UUID}.localhost:${CROSS_DESKTOP_PORT}
+  http://cross-{application-uuid}.localhost:${CROSS_DESKTOP_PORT}
 
-  The X11-to-canvas session supports browser audio, clipboard synchronization,
-  file drag-and-drop and PWA installation. To start VLC:
+  Each application keeps a stable UUID, a dedicated X11-to-canvas session and
+  an application-branded PWA. Sessions support browser audio, clipboard
+  synchronization and file drag-and-drop. To start VLC:
     cross_desktop vlc
 
 Open URLs in ChromeOS Chrome and local targets in Cross Desktop:

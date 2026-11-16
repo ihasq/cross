@@ -148,6 +148,25 @@ CMake, Meson, Autotools, Rust tools, and Node.js tools. `bash`, `sh`, `curl`,
 and `wget` intentionally remain the ChromeOS host commands so the installer can
 be updated even when the Cross service is stopped.
 
+### Open URLs and files
+
+The Crosh-side `open` command uses ChromeOS's system D-Bus URL handler for web
+URLs and Cross Desktop for local files and directories:
+
+```bash
+open https://example.com
+open ~/Downloads/movie.mp4
+open ~/Downloads/photo.jpg
+open .
+open -a mousepad README.md
+```
+
+HTTP, HTTPS, and `mailto:` targets open in ChromeOS Chrome. Audio, video,
+images, text, documents, and directories open respectively in VLC, Ristretto,
+Mousepad, MuPDF, or PCManFM on the browser canvas. `open -a APPLICATION`
+selects an Alpine GUI command explicitly. Running `open` without arguments
+starts Cross Desktop and opens its canvas.
+
 ### Cross Desktop
 
 Start the browser canvas from Crosh:
@@ -163,7 +182,8 @@ loopback interface at:
 http://cross-{uuid}.localhost:32221
 ```
 
-The command prints the concrete URL and asks ChromeOS to open it. Set
+The command prints the concrete URL and opens it through ChromeOS's
+`org.chromium.UrlHandlerService` system D-Bus service. Set
 `CROSS_DESKTOP_OPEN=0` to print the URL without opening a browser. The canvas
 is installable from Chrome as a PWA. The canvas server starts with the main
 Cross service, so an installed PWA remains usable after Cross boot autostart.

@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.51-desktop-runtime"
+SCRIPT_VERSION="2026-11-16.52-open-command"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -739,7 +739,7 @@ install_alpine_packages() {
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
     xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good
     pulseaudio pulseaudio-utils dbus xdg-utils shared-mime-info
-    vlc vlc-qt xterm font-dejavu
+    vlc vlc-qt xterm pcmanfm gvfs mousepad ristretto mupdf-x11 font-dejavu
   )
   if [[ -f "$CROSS_COMPLETE" ]]; then
     apk_chroot add --no-cache "${required[@]}"
@@ -978,6 +978,46 @@ for pathname do
 done
 OPEN_FILE
 
+  cat <<'OPEN_TARGET' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-open-target" >/dev/null
+#!/bin/sh
+set -eu
+target=${1:?missing target}
+unset LD_PRELOAD
+
+case "$target" in
+  rtsp://*|rtsps://*|rtmp://*|rtmps://*|mms://*|mmsh://*|udp://*)
+    exec /usr/bin/vlc "$target"
+    ;;
+esac
+
+if [ -d "$target" ]; then
+  exec /usr/bin/pcmanfm "$target"
+fi
+[ -e "$target" ] || {
+  printf 'open: target not found: %s\n' "$target" >&2
+  exit 1
+}
+
+mime=$(/usr/bin/file --brief --mime-type -- "$target" 2>/dev/null || true)
+case "$mime" in
+  audio/*|video/*|application/ogg|application/x-ogg|application/x-matroska)
+    exec /usr/bin/vlc --started-from-file "$target"
+    ;;
+  image/*)
+    exec /usr/bin/ristretto "$target"
+    ;;
+  text/*|application/json|application/toml|application/xml|application/x-shellscript|application/yaml)
+    exec /usr/bin/mousepad "$target"
+    ;;
+  application/pdf|application/epub+zip|application/oxps|application/vnd.comicbook+zip|application/x-cbz|application/x-xps)
+    exec /usr/bin/mupdf-x11 "$target"
+    ;;
+  *)
+    exec /usr/bin/xdg-open "$target"
+    ;;
+esac
+OPEN_TARGET
+
   cat <<'RUN_APP' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-run-app" >/dev/null
 #!/bin/sh
 set -eu
@@ -1103,6 +1143,19 @@ run_app() {
     start-child /usr/local/libexec/cross-run-app "\$PWD" "\$@" >/dev/null
   printf 'Started %q in Cross Desktop.\n%s\n' "\$1" "\$URL"
 }
+open_targets() {
+  (( \$# > 0 )) || die 'no target supplied'
+  start_server >/dev/null
+  prepare
+  local target
+  for target in "\$@"; do
+    /usr/bin/xpra control --socket-dir="\$SOCKET_DIR" "\$DISPLAY_NUMBER" \
+      start-child /usr/local/libexec/cross-run-app "\$PWD" \
+      /usr/local/libexec/cross-open-target "\$target" >/dev/null
+    printf 'Opened %q in Cross Desktop.\n' "\$target"
+  done
+  printf '%s\n' "\$URL"
+}
 
 case "\${1:-start}" in
   start) shift || true; start_server ;;
@@ -1119,15 +1172,18 @@ case "\${1:-start}" in
   url) printf '%s\n' "\$URL" ;;
   log) tail -n "\${2:-80}" "\$LOG_FILE" ;;
   run) shift; run_app "\$@" ;;
+  open) shift; open_targets "\$@" ;;
   vlc) shift; run_app /usr/bin/vlc "\$@" ;;
   *) run_app "\$@" ;;
 esac
 DESKTOP
   sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
+    "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
   sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
+    "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
   sudo ln -sfn /usr/local/libexec/cross-desktop \
     "$CROSS_ROOT/usr/local/bin/cross_desktop"
@@ -1888,6 +1944,34 @@ exit "$status"
 CLIENT
   chmod 0755 "$CROSS_BIN/cross"
 
+  cat > "$CROSS_BIN/cross-open-url" <<'OPEN_URL_CLIENT'
+#!/bin/bash
+set -Eeuo pipefail
+
+if (( $# != 1 )); then
+  echo 'usage: cross-open-url URL' >&2
+  exit 2
+fi
+url=$1
+case "$url" in
+  http://*|https://*|mailto:*) ;;
+  *) echo "cross-open-url: unsupported URL scheme: $url" >&2; exit 2 ;;
+esac
+[[ -x /usr/bin/dbus-send ]] || {
+  echo 'cross-open-url: ChromeOS dbus-send is unavailable' >&2
+  exit 1
+}
+if ! reply=$(/usr/bin/dbus-send --system --type=method_call --print-reply \
+    --dest=org.chromium.UrlHandlerService \
+    /org/chromium/UrlHandlerService \
+    org.chromium.UrlHandlerServiceInterface.OpenUrl \
+    "string:$url" 2>&1); then
+  printf 'cross-open-url: ChromeOS rejected %s\n%s\n' "$url" "$reply" >&2
+  exit 1
+fi
+OPEN_URL_CLIENT
+  chmod 0755 "$CROSS_BIN/cross-open-url"
+
   cat > "$CROSS_BIN/cross_desktop" <<'DESKTOP_CLIENT'
 #!/bin/bash
 set -Eeuo pipefail
@@ -1903,6 +1987,7 @@ usage() {
   cat <<'USAGE'
 usage: cross_desktop [start|stop|restart|status|url|log [lines]]
        cross_desktop vlc [file ...]
+       cross_desktop open TARGET [TARGET ...]
        cross_desktop run COMMAND [ARG ...]
        cross_desktop -- COMMAND [ARG ...]
 
@@ -1912,12 +1997,7 @@ USAGE
 
 open_browser() {
   [[ "${CROSS_DESKTOP_OPEN:-1}" != 0 ]] || return 0
-  local handler
-  for handler in /usr/bin/xdg-open /usr/bin/url_handler; do
-    [[ -x "$handler" ]] || continue
-    ("$handler" "$CROSS_DESKTOP_URL" </dev/null >/dev/null 2>&1 &) || true
-    return 0
-  done
+  "$SELF_DIR/cross-open-url" "$CROSS_DESKTOP_URL"
 }
 
 command_name="${1:-start}"
@@ -1936,7 +2016,7 @@ case "$command_name" in
   log)
     exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
     ;;
-  vlc|run)
+  vlc|run|open)
     "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
     open_browser
     ;;
@@ -1954,6 +2034,55 @@ esac
 DESKTOP_CLIENT
   chmod 0755 "$CROSS_BIN/cross_desktop"
   ln -sfn cross_desktop "$CROSS_BIN/cross-desktop"
+
+  cat > "$CROSS_BIN/open" <<'OPEN_CLIENT'
+#!/bin/bash
+set -Eeuo pipefail
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+usage() {
+  cat <<'USAGE'
+usage: open [TARGET ...]
+       open -a APPLICATION [ARG ...]
+
+HTTP(S) and mailto URLs open in ChromeOS Chrome. Files and directories open
+in an appropriate Cross Desktop application. With no target, opens the canvas.
+USAGE
+}
+
+if (( $# == 0 )); then
+  exec "$SELF_DIR/cross_desktop"
+fi
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -a|--application)
+    shift
+    (( $# > 0 )) || { echo 'open: -a requires an application command' >&2; exit 2; }
+    application=$1
+    shift
+    exec "$SELF_DIR/cross_desktop" -- "$application" "$@"
+    ;;
+  --) shift ;;
+  -*) echo "open: unknown option: $1" >&2; usage >&2; exit 2 ;;
+esac
+(( $# > 0 )) || exec "$SELF_DIR/cross_desktop"
+
+status=0
+declare -a desktop_targets=()
+for target in "$@"; do
+  case "$target" in
+    http://*|https://*|mailto:*)
+      "$SELF_DIR/cross-open-url" "$target" || status=$?
+      ;;
+    *) desktop_targets+=("$target") ;;
+  esac
+done
+if (( ${#desktop_targets[@]} > 0 )); then
+  "$SELF_DIR/cross_desktop" open "${desktop_targets[@]}" || status=$?
+fi
+exit "$status"
+OPEN_CLIENT
+  chmod 0755 "$CROSS_BIN/open"
 
   local spec cmd remote_path
   local wrapper_specs=(
@@ -2330,6 +2459,11 @@ C_SOURCE
   "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /usr/bin/vlc
+    test -x /usr/bin/pcmanfm
+    test -x /usr/bin/mousepad
+    test -x /usr/bin/ristretto
+    test -x /usr/bin/mupdf-x11
+    test -x /usr/local/libexec/cross-open-target
     test -f /usr/local/share/cross-desktop/www/manifest.webmanifest
     test -f /usr/local/share/cross-desktop/www/sw.js
     curl --silent --fail --max-time 3 http://127.0.0.1:'"$CROSS_DESKTOP_PORT"'/ \
@@ -2394,6 +2528,10 @@ Cross Desktop:
   The X11-to-canvas session supports browser audio, clipboard synchronization,
   file drag-and-drop and PWA installation. To start VLC:
     cross_desktop vlc
+
+Open URLs in ChromeOS Chrome and local targets in Cross Desktop:
+  open https://example.com
+  open ~/Downloads/movie.mp4
 
 Activate wrappers:
   source ~/.bashrc

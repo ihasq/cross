@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.49-cross-desktop"
+SCRIPT_VERSION="2026-11-16.50-desktop-settings"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -947,6 +947,10 @@ PWA
     -e 's#<title>[^<]*</title>#<title>Cross Desktop</title>#' \
     -e 's#content="xpra websockets client"#content="Cross Desktop"#' \
     "$www/index.html"
+  # Alpine packages this path as an absolute symlink into /etc/xpra. Since the
+  # web root is being assembled from outside the chroot, replace the copied
+  # link itself before writing or tee would follow it on the ChromeOS host.
+  sudo rm -f "$www/default-settings.txt"
   cat <<'SETTINGS' | sudo tee "$www/default-settings.txt" >/dev/null
 # Cross Desktop HTML5 defaults
 clipboard = true

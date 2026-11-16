@@ -199,6 +199,19 @@ cross_desktop vlc
 cross_desktop vlc ~/Downloads/movie.mp4
 ```
 
+Run GIMP 3 in its own application-branded PWA. GIMP uses its default
+single-window interface and Cross suppresses the startup splash and first-run
+welcome dialog so the editor becomes the page window directly:
+
+```bash
+cross_desktop gimp
+cross_desktop gimp ~/Downloads/image.png
+open -a gimp ~/Downloads/image.png
+```
+
+GIMP receives the shared ChromeOS path directly. Its UUID, configuration,
+recent launch and PWA icon persist like the other Cross applications.
+
 Other Alpine GUI applications can be started with either form:
 
 ```bash

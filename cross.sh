@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.53-app-sessions"
+SCRIPT_VERSION="2026-11-16.54-gimp"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -738,8 +738,8 @@ install_alpine_packages() {
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
     xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good
-    pulseaudio pulseaudio-utils dbus xdg-utils shared-mime-info
-    vlc vlc-qt xterm pcmanfm gvfs mousepad ristretto mupdf-x11 font-dejavu
+    pulseaudio pulseaudio-utils dbus dbus-x11 xdg-utils shared-mime-info
+    vlc vlc-qt gimp xterm pcmanfm gvfs mousepad ristretto mupdf-x11 font-dejavu
   )
   if [[ -f "$CROSS_COMPLETE" ]]; then
     apk_chroot add --no-cache "${required[@]}"
@@ -983,7 +983,7 @@ APP_CSS
       if (!remote || fitted.has(wid) || remote.tray || remote.override_redirect) continue;
       const metadata = remote.metadata || {};
       const type = remote.windowtype || "NORMAL";
-      if (metadata["transient-for"] || type === "DIALOG" || type === "UTILITY") continue;
+      if (metadata["transient-for"] || (type && type !== "NORMAL")) continue;
       fitted.add(wid);
       try {
         remote._set_decorated(false);
@@ -1249,6 +1249,45 @@ case "$application" in
 esac
 OPEN_TARGET
 
+  cat <<'GIMP_LAUNCHER' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-gimp" >/dev/null
+#!/bin/sh
+set -eu
+unset LD_PRELOAD
+export GDK_BACKEND=x11
+
+gimp_version="$(/usr/bin/gimp --version 2>/dev/null \
+  | sed -n 's/^GNU Image Manipulation Program version \([0-9][0-9.]*\).*$/\1/p' \
+  | head -n 1)"
+[ -n "$gimp_version" ] || gimp_version=3.0.0
+config_series="${gimp_version%.*}"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+config_dir="$config_home/GIMP/$config_series"
+gimprc="$config_dir/gimprc"
+mkdir -p "$config_dir"
+touch "$gimprc"
+
+set_gimp_config() {
+  key=$1
+  value=$2
+  if grep -Eq "^[[:space:]]*\\($key[[:space:]]" "$gimprc"; then
+    sed -i "s|^[[:space:]]*($key[[:space:]].*|($key $value)|" "$gimprc"
+  else
+    printf '(%s %s)\n' "$key" "$value" >> "$gimprc"
+  fi
+}
+
+# GIMP treats a missing config version as an upgrade and opens its Welcome
+# dialog even when show-welcome-dialog is disabled. Record the installed
+# version before startup so the canvas itself is the PWA's primary window.
+set_gimp_config config-version "\"$gimp_version\""
+set_gimp_config show-welcome-dialog no
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+  exec dbus-run-session -- /usr/bin/gimp --no-splash "$@"
+fi
+exec /usr/bin/gimp --no-splash "$@"
+GIMP_LAUNCHER
+
   cat <<'RUN_APP' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-run-app" >/dev/null
 #!/bin/sh
 set -eu
@@ -1337,17 +1376,24 @@ find_desktop_file() {
   return 1
 }
 find_icon() {
-  local icon_name=$1 candidate found=""
+  local icon_name=$1 candidate found="" extension
   if [[ "$icon_name" == /* && -r "$icon_name" ]]; then
     printf '%s\n' "$icon_name"
     return
   fi
-  while IFS= read -r candidate; do found=$candidate; done < <(
-    find /usr/share/icons /usr/share/pixmaps -type f \
-      \( -name "$icon_name.png" -o -name "$icon_name.svg" -o -name "$icon_name.xpm" \) \
-      2>/dev/null | sort -V
-  )
-  [[ -n "$found" ]] && printf '%s\n' "$found"
+  # Prefer raster artwork because Alpine's ffmpeg build cannot decode SVG.
+  # sort -V leaves the largest hicolor resolution as the final PNG match.
+  for extension in png svg xpm; do
+    found=""
+    while IFS= read -r candidate; do found=$candidate; done < <(
+      find /usr/share/icons /usr/share/pixmaps -type f \
+        -name "$icon_name.$extension" 2>/dev/null | sort -V
+    )
+    if [[ -n "$found" ]]; then
+      printf '%s\n' "$found"
+      return
+    fi
+  done
 }
 write_app_assets() {
   local executable=$1 app_dir=$2 desktop="" name icon_name icon_path="" size
@@ -1398,7 +1444,11 @@ ensure_app() {
     printf '%s\n' "$((BACKEND_PORT_BASE + slot))" > "$app_dir/port"
     printf '%s\n' "$((DISPLAY_BASE + slot))" > "$app_dir/display"
     write_app_assets "$executable" "$app_dir"
-    printf '#!/bin/sh\nexec %q "$@"\n' "$executable" > "$app_dir/open-file"
+    if [[ "$executable" == /usr/bin/gimp ]]; then
+      printf '#!/bin/sh\nexec /usr/local/libexec/cross-gimp "$@"\n' > "$app_dir/open-file"
+    else
+      printf '#!/bin/sh\nexec %q "$@"\n' "$executable" > "$app_dir/open-file"
+    fi
     chmod 0700 "$app_dir/open-file"
   fi
   flock -u 9
@@ -1446,7 +1496,7 @@ start_app_session() {
     --session-name="$name" \
     --mdns=no \
     --systemd-run=no \
-    --dbus=no \
+    --dbus=yes \
     --clipboard=yes \
     --file-transfer=yes \
     --file-size-limit=2048 \
@@ -1533,8 +1583,15 @@ launch_for_app() {
   app_url "$APP_DIR"
 }
 run_app() {
+  local executable
   (( $# > 0 )) || die 'no application command supplied'
-  launch_for_app "$1" "$@"
+  executable="$(resolve_executable "$1")"
+  if [[ "$executable" == /usr/bin/gimp ]]; then
+    shift
+    launch_for_app "$executable" /usr/local/libexec/cross-gimp "$@"
+  else
+    launch_for_app "$executable" "$@"
+  fi
 }
 open_targets() {
   (( $# > 0 )) || die 'no target supplied'
@@ -1629,6 +1686,7 @@ case "${1:-start}" in
   run) shift; run_app "$@" ;;
   open) shift; open_targets "$@" ;;
   vlc) shift; run_app /usr/bin/vlc "$@" ;;
+  gimp) shift; run_app /usr/bin/gimp "$@" ;;
   *) run_app "$@" ;;
 esac
 DESKTOP
@@ -1639,11 +1697,13 @@ DESKTOP
     "$CROSS_ROOT/usr/local/libexec/cross-desktop"
   sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
+    "$CROSS_ROOT/usr/local/libexec/cross-gimp" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
   sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
+    "$CROSS_ROOT/usr/local/libexec/cross-gimp" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
@@ -2449,6 +2509,7 @@ usage() {
   cat <<'USAGE'
 usage: cross_desktop [start|stop|restart|status|url|log [lines]]
        cross_desktop vlc [file ...]
+       cross_desktop gimp [image ...]
        cross_desktop open TARGET [TARGET ...]
        cross_desktop run COMMAND [ARG ...]
        cross_desktop -- COMMAND [ARG ...]
@@ -2492,7 +2553,7 @@ case "$command_name" in
   log)
     exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
     ;;
-  vlc|run|open)
+  vlc|gimp|run|open)
     run_and_open "$@"
     ;;
   --)
@@ -2900,7 +2961,7 @@ validate() {
   "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra vlc xterm; do
+    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra dbus-launch vlc gimp xterm; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
   '
@@ -2935,6 +2996,8 @@ C_SOURCE
   "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /usr/bin/vlc
+    test -x /usr/bin/gimp
+    test -x /usr/local/libexec/cross-gimp
     test -x /usr/bin/pcmanfm
     test -x /usr/bin/mousepad
     test -x /usr/bin/ristretto
@@ -2948,6 +3011,7 @@ C_SOURCE
     curl --silent --fail --max-time 3 -H "Host: '"$desktop_host"'" \
       http://127.0.0.1:'"$CROSS_DESKTOP_PORT"'/manifest.webmanifest \
       | grep -q '"name":"XTerm"'
+    gimp --version | grep -q "GNU Image Manipulation Program"
   '
   [[ "$("$CROSS_BIN/cross" /usr/local/libexec/cross-desktop url)" == "$desktop_url" ]] \
     || die "Cross Desktop did not preserve the default application UUID"
@@ -3011,6 +3075,10 @@ Cross Desktop:
   an application-branded PWA. Sessions support browser audio, clipboard
   synchronization and file drag-and-drop. To start VLC:
     cross_desktop vlc
+
+  To start GIMP in its application-branded PWA:
+    cross_desktop gimp
+    cross_desktop gimp ~/Downloads/image.png
 
 Open URLs in ChromeOS Chrome and local targets in Cross Desktop:
   open https://example.com

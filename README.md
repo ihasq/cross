@@ -40,6 +40,8 @@ environment includes:
 - Node.js, npm, npx, and Corepack
 - Common development libraries such as OpenSSL, zlib, SQLite, libffi, libxml2,
   libxslt, libarchive, libssh2, and libuv
+- Cross Desktop, an Xpra-backed X11-to-canvas layer with VLC, browser audio,
+  clipboard synchronization, file drag-and-drop, and PWA metadata
 
 Cross does not build third-party tools from source. It builds only a small
 musl compatibility DSO needed by glibc-linked `workerd` binaries used by some
@@ -146,6 +148,57 @@ CMake, Meson, Autotools, Rust tools, and Node.js tools. `bash`, `sh`, `curl`,
 and `wget` intentionally remain the ChromeOS host commands so the installer can
 be updated even when the Cross service is stopped.
 
+### Cross Desktop
+
+Start the browser canvas from Crosh:
+
+```bash
+cross_desktop
+```
+
+Each installation keeps a stable random UUID and serves its GUI only on the
+loopback interface at:
+
+```text
+http://cross-{uuid}.localhost:32221
+```
+
+The command prints the concrete URL and asks ChromeOS to open it. Set
+`CROSS_DESKTOP_OPEN=0` to print the URL without opening a browser. The canvas
+is installable from Chrome as a PWA. The canvas server starts with the main
+Cross service, so an installed PWA remains usable after Cross boot autostart.
+
+Run VLC, optionally opening a file from the shared ChromeOS home directory:
+
+```bash
+cross_desktop vlc
+cross_desktop vlc ~/Downloads/movie.mp4
+```
+
+Other Alpine GUI applications can be started with either form:
+
+```bash
+cross_desktop run xterm
+cross_desktop -- my-gui-program --flag
+```
+
+Desktop session controls are:
+
+```bash
+cross_desktop status
+cross_desktop stop
+cross_desktop restart
+cross_desktop log
+cross_desktop url
+```
+
+Dragging files from ChromeOS onto the canvas uploads them to the Alpine
+session. Recognized audio and video files are opened in VLC; other files remain
+available in `~/Downloads`. Clipboard exchange is enabled in both directions,
+subject to Chrome's clipboard permission and user-gesture rules. The browser
+toolbar also exposes upload, download, audio, clipboard, fullscreen, and
+on-screen keyboard controls.
+
 ### Working directories
 
 When a command is launched from the ChromeOS home directory, Cross uses the
@@ -185,6 +238,21 @@ Crosh command
   -> forced Cross session
   -> Alpine chroot
 ```
+
+The optional GUI path is:
+
+```text
+Chrome/PWA at cross-{uuid}.localhost:32221
+  -> localhost-only Xpra HTTP/WebSocket server
+  -> virtual X11 display :100
+  -> Alpine GUI application (for example VLC)
+```
+
+Xpra sends window updates to browser canvases and negotiates native browser
+video decoding where available. PulseAudio and GStreamer provide speaker audio
+to the browser. Cross forces common Wayland-capable toolkits onto their X11
+backend for this virtual display (`QT_QPA_PLATFORM=xcb`, `GDK_BACKEND=x11`), so
+the layer does not depend on the ChromeOS display server.
 
 The SSH daemon listens only on `127.0.0.1` and accepts the dedicated key created
 by the installer. Arbitrary SSH forwarding is disabled. The forced session
@@ -269,6 +337,13 @@ the design include:
 - The local SSH service is restricted to loopback and key authentication, but
   it still exposes a privileged development environment to local host
   processes that can access its private key.
+- Cross Desktop listens only on `127.0.0.1:32221` and requires the installation
+  UUID in the WebSocket `Host` header. The UUID isolates the browser origin; it
+  is not a security boundary against other local processes, which can read or
+  forge localhost traffic.
+- Enabling clipboard and file transfer exposes copied or dropped data to the
+  Alpine session. Dropped media is opened automatically in VLC; other uploaded
+  files are saved without automatic execution.
 
 Review `cross.sh` before running it and keep backups of important data.
 
@@ -308,6 +383,20 @@ Verify that ChromeOS itself has network access, then rerun the installer. Cross
 copies a usable host DNS configuration into Alpine during setup and validates
 resolution before completing.
 
+### Cross Desktop does not open or has no audio
+
+Check the canvas service and its Xpra/PulseAudio log:
+
+```bash
+cross_desktop status
+cross_desktop log 120
+```
+
+If the main Cross service is stopped, start it from VT-2 first. Chrome may
+require one click in the canvas before it allows audio playback or clipboard
+access. `cross_desktop restart` recreates the virtual display and its private
+PulseAudio server.
+
 ### Boot autostart requires a reboot and rerun
 
 This is expected on a stock ChromeOS release image. The first run completes
@@ -344,7 +433,7 @@ job and preserves the existing Alpine environment where possible.
 | `/usr/local/cross/alpine` | Alpine root filesystem |
 | `/usr/local/cross/bin` | `cross`, its compatibility helpers, and host wrappers |
 | `/usr/local/cross/cache` | Download cache |
-| `/usr/local/cross/etc` | Cross and SSH client configuration |
+| `/usr/local/cross/etc` | Cross, desktop UUID, and SSH client configuration |
 | `/usr/local/cross/log` | Cross service and boot-start logs |
 | `/usr/local/cross/run` | Runtime client state |
 | `/usr/local/cross/work/chronos` | Additional writable development area |

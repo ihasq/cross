@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-11.48-ascii-banner"
+SCRIPT_VERSION="2026-11-16.49-cross-desktop"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -33,6 +33,8 @@ CROSS_RUN="$CROSS_PREFIX/run"
 CROSS_LOG="$CROSS_PREFIX/log"
 CROSS_WORK="$CROSS_PREFIX/work"
 CROSS_SSH_PORT="${CROSS_SSH_PORT:-32222}"
+CROSS_DESKTOP_PORT="${CROSS_DESKTOP_PORT:-32221}"
+CROSS_DESKTOP_UUID=""
 CROSS_MARKER="$CROSS_PREFIX/.alpine-cross-managed"
 CROSS_COMPLETE="$CROSS_PREFIX/.alpine-cross-complete"
 LOG_FILE="${HOME:-/home/chronos/user}/cross-setup-$(date +%Y%m%d-%H%M%S).log"
@@ -118,7 +120,11 @@ Cross is a successor project to Chromebrew. By accepting, you agree:
    require recovery media to restore the device. Hardware write protection is
    not changed. Cross setup continues if autostart cannot be configured safely.
 
-7. Acceptance authorizes the operations above. Otherwise setup will exit.
+7. Cross Desktop adds a localhost-only Xpra HTTP/WebSocket service on port
+   32221. Its browser client can exchange clipboard contents and files with the
+   Alpine session, and dropped media files may be opened automatically in VLC.
+
+8. Acceptance authorizes the operations above. Otherwise setup will exit.
 CROSS_EULA
   while :; do
     printf '\nDo you accept the Cross EULA? [y/n]: ' >/dev/tty
@@ -395,6 +401,11 @@ preflight() {
   [[ "$CROSS_SSH_PORT" =~ ^[0-9]+$ ]] &&
     (( CROSS_SSH_PORT >= 1024 && CROSS_SSH_PORT <= 65535 )) \
     || die "CROSS_SSH_PORT must be 1024..65535"
+  [[ "$CROSS_DESKTOP_PORT" =~ ^[0-9]+$ ]] &&
+    (( CROSS_DESKTOP_PORT >= 1024 && CROSS_DESKTOP_PORT <= 65535 )) \
+    || die "CROSS_DESKTOP_PORT must be 1024..65535"
+  [[ "$CROSS_DESKTOP_PORT" != "$CROSS_SSH_PORT" ]] \
+    || die "CROSS_DESKTOP_PORT and CROSS_SSH_PORT must be different"
   opts="$(awk '$2 == "/usr/local" {print $4}' /proc/mounts | tail -n1)"
   [[ ",$opts," != *,noexec,* ]] || die "/usr/local is noexec"
   [[ ",$opts," != *,nosuid,* ]] || die "/usr/local nosuid; Alpine sudo needs setuid"
@@ -726,6 +737,9 @@ install_alpine_packages() {
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
+    xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good
+    pulseaudio pulseaudio-utils dbus xdg-utils shared-mime-info
+    vlc vlc-qt xterm font-dejavu
   )
   if [[ -f "$CROSS_COMPLETE" ]]; then
     apk_chroot add --no-cache "${required[@]}"
@@ -798,6 +812,325 @@ SUDOERS
   sudo chmod 0440 "$CROSS_ROOT/etc/sudoers.d/cross-chronos"
   [[ -u "$CROSS_ROOT/usr/bin/sudo" ]] || die "Alpine sudo not setuid root"
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/visudo -cf /etc/sudoers >/dev/null
+}
+
+configure_cross_desktop() {
+  info "Configuring Cross Desktop canvas service"
+  local uid gid host_home uuid_file www index_tmp
+  uid="$(id -u)"; gid="$(id -g)"; host_home="${HOME:-/home/chronos/user}"
+  uuid_file="$CROSS_ETC/desktop.uuid"
+  www="$CROSS_ROOT/usr/local/share/cross-desktop/www"
+
+  if [[ -r "$uuid_file" ]]; then
+    CROSS_DESKTOP_UUID="$(tr -d '\r\n' < "$uuid_file")"
+  fi
+  if [[ ! "$CROSS_DESKTOP_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    CROSS_DESKTOP_UUID="$(tr 'A-F' 'a-f' < /proc/sys/kernel/random/uuid)"
+    [[ "$CROSS_DESKTOP_UUID" =~ ^[0-9a-f-]{36}$ ]] \
+      || die "could not generate the Cross Desktop UUID"
+    printf '%s\n' "$CROSS_DESKTOP_UUID" | sudo tee "$uuid_file" >/dev/null
+  fi
+  sudo chown root:root "$uuid_file"
+  sudo chmod 0644 "$uuid_file"
+
+  [[ -f "$CROSS_ROOT/usr/share/xpra/www/index.html" ]] \
+    || die "xpra-webclient did not install its HTML5 client"
+  sudo rm -rf "$CROSS_ROOT/usr/local/share/cross-desktop"
+  sudo mkdir -p "$www" "$CROSS_ROOT/usr/local/bin" "$CROSS_ROOT/usr/local/libexec" \
+    "$CROSS_ROOT/run/user/$uid"
+  sudo cp -a "$CROSS_ROOT/usr/share/xpra/www/." "$www/"
+  # The package ships pre-compressed copies. They must not shadow the branded
+  # index and PWA files below.
+  sudo find "$www" -type f -name '*.gz' -delete
+  sudo chown "$uid:$gid" "$CROSS_ROOT/run/user/$uid"
+  sudo chmod 0700 "$CROSS_ROOT/run/user/$uid"
+
+  cat <<MANIFEST | sudo tee "$www/manifest.webmanifest" >/dev/null
+{
+  "id": "/",
+  "name": "Cross Desktop",
+  "short_name": "Cross",
+  "description": "Alpine GUI applications on ChromeOS",
+  "start_url": "/?sound=true&video=true&clipboard=true&file_transfer=true",
+  "scope": "/",
+  "display": "fullscreen",
+  "prefer_related_applications": false,
+  "background_color": "#101826",
+  "theme_color": "#2563eb",
+  "icons": [
+    {"src": "/cross-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/cross-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/cross-desktop.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}
+  ]
+}
+MANIFEST
+  cat <<'ICON' | sudo tee "$www/cross-desktop.svg" >/dev/null
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="104" fill="#101826"/>
+  <path d="M128 128 384 384M384 128 128 384" stroke="#60a5fa" stroke-width="72" stroke-linecap="round"/>
+  <circle cx="256" cy="256" r="52" fill="#f8fafc"/>
+</svg>
+ICON
+  # Chromium's installability checks require explicit 192px and 512px raster
+  # icons. Generate two tiny, opaque PNGs without adding an image-tool package.
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/python3 - \
+    /usr/local/share/cross-desktop/www <<'PYTHON_ICON'
+import binascii
+import pathlib
+import struct
+import sys
+import zlib
+
+output = pathlib.Path(sys.argv[1])
+
+def chunk(kind, data):
+    checksum = binascii.crc32(kind + data) & 0xffffffff
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+def make_icon(size):
+    background = (16, 24, 38)
+    blue = (96, 165, 250)
+    white = (248, 250, 252)
+    inset = size * 28 // 100
+    width = size * 14 // 100
+    radius = size * 10 // 100
+    pixels = []
+    for y in range(size):
+        row = bytearray((0,))
+        for x in range(size):
+            diagonal = min(abs(x - y), abs((size - 1 - x) - y))
+            inside_x = inset - width <= x <= size - inset + width
+            inside_y = inset - width <= y <= size - inset + width
+            color = blue if inside_x and inside_y and diagonal <= width // 2 else background
+            if (x - size // 2) ** 2 + (y - size // 2) ** 2 <= radius ** 2:
+                color = white
+            row.extend(color)
+        pixels.append(bytes(row))
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) +
+            chunk(b"IDAT", zlib.compress(b"".join(pixels), 9)) + chunk(b"IEND", b""))
+
+for icon_size in (192, 512):
+    (output / f"cross-icon-{icon_size}.png").write_bytes(make_icon(icon_size))
+PYTHON_ICON
+  cat <<PWA | sudo tee "$www/cross-pwa.js" >/dev/null
+(() => {
+  const expected = "cross-${CROSS_DESKTOP_UUID}.localhost";
+  if (location.hostname !== expected &&
+      (location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
+    const port = location.port ? ":" + location.port : "";
+    location.replace(location.protocol + "//" + expected + port + location.pathname + location.search + location.hash);
+    return;
+  }
+  if ("serviceWorker" in navigator) {
+    addEventListener("load", () => navigator.serviceWorker.register("/sw.js", {scope: "/"})
+      .catch((error) => console.warn("Cross Desktop service worker:", error)));
+  }
+})();
+PWA
+  # Add PWA metadata without depending on the exact formatting of the packaged
+  # Xpra index. Keep the original Xpra client code intact.
+  index_tmp="$(mktemp)"
+  sudo awk '
+    /<\/head>/ && !done {
+      print "    <meta name=\"theme-color\" content=\"#2563eb\" />"
+      print "    <link rel=\"manifest\" href=\"/manifest.webmanifest\" />"
+      print "    <link rel=\"icon\" href=\"/cross-desktop.svg\" type=\"image/svg+xml\" />"
+      print "    <script defer src=\"/cross-pwa.js\"></script>"
+      done=1
+    }
+    {print}
+  ' "$www/index.html" > "$index_tmp"
+  sudo install -o root -g root -m 0644 "$index_tmp" "$www/index.html"
+  rm -f "$index_tmp"
+  sudo sed -i \
+    -e 's#<title>[^<]*</title>#<title>Cross Desktop</title>#' \
+    -e 's#content="xpra websockets client"#content="Cross Desktop"#' \
+    "$www/index.html"
+  cat <<'SETTINGS' | sudo tee "$www/default-settings.txt" >/dev/null
+# Cross Desktop HTML5 defaults
+clipboard = true
+file_transfer = true
+sound = true
+video = true
+offscreen = true
+reconnect = true
+floating_menu = true
+min-quality = 20
+min-speed = 50
+SETTINGS
+  sudo chown -R root:root "$CROSS_ROOT/usr/local/share/cross-desktop"
+  sudo find "$CROSS_ROOT/usr/local/share/cross-desktop" -type d -exec chmod 0755 {} +
+  sudo find "$CROSS_ROOT/usr/local/share/cross-desktop" -type f -exec chmod 0644 {} +
+
+  cat <<'OPEN_FILE' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-open-file" >/dev/null
+#!/bin/sh
+set -eu
+unset LD_PRELOAD
+for pathname do
+  [ -f "$pathname" ] || continue
+  lower=$(printf '%s' "$pathname" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    *.3g2|*.3gp|*.aac|*.avi|*.flac|*.flv|*.m2ts|*.m4a|*.m4v|*.mkv|*.mov|*.mp3|*.mp4|*.mpeg|*.mpg|*.ogg|*.ogv|*.opus|*.ts|*.wav|*.webm|*.wmv)
+      exec /usr/bin/vlc --started-from-file "$pathname"
+      ;;
+  esac
+done
+OPEN_FILE
+
+  cat <<'RUN_APP' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-run-app" >/dev/null
+#!/bin/sh
+set -eu
+cwd=${1:?missing working directory}
+shift
+[ "$#" -gt 0 ] || { echo 'cross-run-app: missing application' >&2; exit 2; }
+cd -- "$cwd" 2>/dev/null || cd -- "$HOME"
+exec "$@"
+RUN_APP
+
+  cat <<DESKTOP | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-desktop" >/dev/null
+#!/bin/bash
+set -Eeuo pipefail
+
+DISPLAY_NUMBER=:100
+PORT=$CROSS_DESKTOP_PORT
+UUID=$CROSS_DESKTOP_UUID
+URL=http://cross-${CROSS_DESKTOP_UUID}.localhost:${CROSS_DESKTOP_PORT}
+HOME=$(printf '%q' "$host_home")
+export HOME DISPLAY="\$DISPLAY_NUMBER" USER=chronos LOGNAME=chronos
+export XDG_RUNTIME_DIR=/run/user/$uid
+export XDG_CONFIG_HOME="\${XDG_CONFIG_HOME:-\$HOME/.config}"
+export XDG_CACHE_HOME="\${XDG_CACHE_HOME:-\$HOME/.cache}"
+export XDG_DATA_HOME="\${XDG_DATA_HOME:-\$HOME/.local/share}"
+export QT_QPA_PLATFORM=xcb GDK_BACKEND=x11 SDL_VIDEODRIVER=x11
+export QT_X11_NO_MITSHM=1 LIBGL_ALWAYS_SOFTWARE=1
+unset LD_PRELOAD
+
+STATE_DIR="\$HOME/.local/state/cross-desktop"
+SOCKET_DIR="\$XDG_RUNTIME_DIR/xpra"
+PID_FILE="\$XDG_RUNTIME_DIR/cross-desktop.pid"
+LOG_FILE="\$STATE_DIR/xpra.log"
+
+die() { printf 'cross_desktop: ERROR: %s\n' "\$*" >&2; exit 1; }
+running_pid() {
+  local pid
+  [[ -r "\$PID_FILE" ]] || return 1
+  read -r pid < "\$PID_FILE" || return 1
+  [[ "\$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "\$pid" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/\$pid/cmdline" 2>/dev/null | grep -q '[x]pra' || return 1
+  printf '%s\n' "\$pid"
+}
+prepare() {
+  mkdir -p "\$STATE_DIR" "\$SOCKET_DIR" "\$HOME/Downloads" \
+    "\$XDG_CONFIG_HOME" "\$XDG_CACHE_HOME" "\$XDG_DATA_HOME"
+  chmod 0700 "\$XDG_RUNTIME_DIR" "\$SOCKET_DIR"
+}
+start_server() {
+  local pid attempt
+  prepare
+  if pid="\$(running_pid 2>/dev/null)"; then
+    printf 'Cross Desktop is running (pid %s).\n%s\n' "\$pid" "\$URL"
+    return 0
+  fi
+  rm -f "\$PID_FILE"
+  /usr/bin/xpra start "\$DISPLAY_NUMBER" \
+    --daemon=yes \
+    --bind-tcp="127.0.0.1:\$PORT,auth=http-header,property=Host,value=cross-\$UUID.localhost:\$PORT" \
+    --html=/usr/local/share/cross-desktop/www \
+    --socket-dir="\$SOCKET_DIR" \
+    --pidfile="\$PID_FILE" \
+    --log-dir="\$STATE_DIR" \
+    --log-file=xpra.log \
+    --session-name="Cross Desktop" \
+    --mdns=no \
+    --systemd-run=no \
+    --dbus=no \
+    --clipboard=yes \
+    --file-transfer=yes \
+    --file-size-limit=2048 \
+    --open-files=yes \
+    --open-url=no \
+    --open-command=/usr/local/libexec/cross-open-file \
+    --printing=no \
+    --webcam=no \
+    --audio=yes \
+    --pulseaudio=yes \
+    --speaker=on \
+    --microphone=disabled \
+    --start-new-commands=yes \
+    --resize-display=yes \
+    --sharing=no \
+    --exit-with-client=no \
+    --exit-with-children=no \
+    --terminate-children=yes \
+    --notifications=yes
+  for ((attempt=1; attempt<=80; attempt++)); do
+    if pid="\$(running_pid 2>/dev/null)" &&
+       /usr/bin/curl --silent --fail --max-time 1 "http://127.0.0.1:\$PORT/" >/dev/null; then
+      printf 'Cross Desktop started (pid %s).\n%s\n' "\$pid" "\$URL"
+      return 0
+    fi
+    sleep 0.1
+  done
+  [[ ! -r "\$LOG_FILE" ]] || tail -n 80 "\$LOG_FILE" >&2
+  die "Xpra did not become ready on 127.0.0.1:\$PORT"
+}
+stop_server() {
+  local pid
+  if ! pid="\$(running_pid 2>/dev/null)"; then
+    echo 'Cross Desktop is stopped.'
+    return 0
+  fi
+  /usr/bin/xpra stop "\$DISPLAY_NUMBER" --socket-dir="\$SOCKET_DIR" >/dev/null 2>&1 || kill -TERM "\$pid" 2>/dev/null || true
+  for _ in {1..40}; do
+    kill -0 "\$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  rm -f "\$PID_FILE"
+  echo 'Cross Desktop stopped.'
+}
+run_app() {
+  (( \$# > 0 )) || die 'no application command supplied'
+  if [[ "\$1" == */* ]]; then
+    [[ -x "\$1" ]] || die "application is not executable: \$1"
+  else
+    command -v "\$1" >/dev/null 2>&1 || die "application not found: \$1"
+  fi
+  start_server >/dev/null
+  prepare
+  /usr/bin/xpra control --socket-dir="\$SOCKET_DIR" "\$DISPLAY_NUMBER" \
+    start-child /usr/local/libexec/cross-run-app "\$PWD" "\$@" >/dev/null
+  printf 'Started %q in Cross Desktop.\n%s\n' "\$1" "\$URL"
+}
+
+case "\${1:-start}" in
+  start) shift || true; start_server ;;
+  stop) shift; stop_server ;;
+  restart) shift; stop_server; start_server ;;
+  status)
+    if pid="\$(running_pid 2>/dev/null)"; then
+      printf 'Cross Desktop is running (pid %s, 127.0.0.1:%s).\n%s\n' "\$pid" "\$PORT" "\$URL"
+    else
+      echo 'Cross Desktop is stopped.'
+      exit 3
+    fi
+    ;;
+  url) printf '%s\n' "\$URL" ;;
+  log) tail -n "\${2:-80}" "\$LOG_FILE" ;;
+  run) shift; run_app "\$@" ;;
+  vlc) shift; run_app /usr/bin/vlc "\$@" ;;
+  *) run_app "\$@" ;;
+esac
+DESKTOP
+  sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
+    "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
+    "$CROSS_ROOT/usr/local/libexec/cross-run-app"
+  sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
+    "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
+    "$CROSS_ROOT/usr/local/libexec/cross-run-app"
+  sudo ln -sfn /usr/local/libexec/cross-desktop \
+    "$CROSS_ROOT/usr/local/bin/cross_desktop"
 }
 
 write_ssh_service() {
@@ -1039,6 +1372,10 @@ SSHCFG
     printf 'CHROOT_BIN=%q\n' "$CHROOT_BIN"
     printf 'HOST_SSH_BIN=%q\n' "$HOST_SSH_BIN"
     printf 'CROSS_SSH_PORT=%q\n' "$CROSS_SSH_PORT"
+    printf 'CROSS_DESKTOP_PORT=%q\n' "$CROSS_DESKTOP_PORT"
+    printf 'CROSS_DESKTOP_UUID=%q\n' "$CROSS_DESKTOP_UUID"
+    printf 'CROSS_DESKTOP_URL=%q\n' \
+      "http://cross-${CROSS_DESKTOP_UUID}.localhost:${CROSS_DESKTOP_PORT}"
   } | sudo tee "$CROSS_ETC/cross.conf" >/dev/null
   sudo chown root:root "$CROSS_ETC/cross.conf"
   sudo chmod 0644 "$CROSS_ETC/cross.conf"
@@ -1329,11 +1666,20 @@ show_auth_failure() {
     || sudo tail -n 80 "$LOG_FILE" | sed 's/^/sshd: /' >&2 || true
 }
 
+start_desktop_service() {
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/su-exec chronos \
+      /usr/local/libexec/cross-desktop start; then
+    warn "Cross Desktop did not start; inspect it with: cross_desktop log 120"
+    return 1
+  fi
+}
+
 start_service() {
   ensure_vt2_context
   local pid i
   if pid="$(master_pid 2>/dev/null)"; then
     if auth_probe; then
+      start_desktop_service || true
       info "running and authenticated (pid $pid, 127.0.0.1:$CROSS_SSH_PORT)"
       return 0
     fi
@@ -1347,6 +1693,7 @@ start_service() {
     -f /etc/ssh/sshd_config_cross -E /var/log/cross-sshd.log
   for ((i=1; i<=30; i++)); do
     if pid="$(master_pid 2>/dev/null)" && auth_probe; then
+      start_desktop_service || true
       info "started and authenticated (pid $pid, 127.0.0.1:$CROSS_SSH_PORT)"
       return 0
     fi
@@ -1532,6 +1879,73 @@ fi
 exit "$status"
 CLIENT
   chmod 0755 "$CROSS_BIN/cross"
+
+  cat > "$CROSS_BIN/cross_desktop" <<'DESKTOP_CLIENT'
+#!/bin/bash
+set -Eeuo pipefail
+
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PREFIX="$(dirname -- "$SELF_DIR")"
+CONFIG="$PREFIX/etc/cross.conf"
+[[ -r "$CONFIG" ]] || { echo "cross_desktop: missing $CONFIG; rerun cross.sh" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG"
+
+usage() {
+  cat <<'USAGE'
+usage: cross_desktop [start|stop|restart|status|url|log [lines]]
+       cross_desktop vlc [file ...]
+       cross_desktop run COMMAND [ARG ...]
+       cross_desktop -- COMMAND [ARG ...]
+
+With no arguments, starts Cross Desktop and opens its ChromeOS URL.
+USAGE
+}
+
+open_browser() {
+  [[ "${CROSS_DESKTOP_OPEN:-1}" != 0 ]] || return 0
+  local handler
+  for handler in /usr/bin/xdg-open /usr/bin/url_handler; do
+    [[ -x "$handler" ]] || continue
+    ("$handler" "$CROSS_DESKTOP_URL" </dev/null >/dev/null 2>&1 &) || true
+    return 0
+  done
+}
+
+command_name="${1:-start}"
+case "$command_name" in
+  -h|--help|help) usage; exit 0 ;;
+  start|restart)
+    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$command_name"
+    open_browser
+    ;;
+  stop|status)
+    exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
+    ;;
+  url)
+    printf '%s\n' "$CROSS_DESKTOP_URL"
+    ;;
+  log)
+    exec "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
+    ;;
+  vlc|run)
+    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@"
+    open_browser
+    ;;
+  --)
+    shift
+    (( $# > 0 )) || { usage >&2; exit 2; }
+    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop run "$@"
+    open_browser
+    ;;
+  *)
+    "$SELF_DIR/cross" /usr/local/libexec/cross-desktop run "$@"
+    open_browser
+    ;;
+esac
+DESKTOP_CLIENT
+  chmod 0755 "$CROSS_BIN/cross_desktop"
+  ln -sfn cross_desktop "$CROSS_BIN/cross-desktop"
 
   local spec cmd remote_path
   local wrapper_specs=(
@@ -1875,7 +2289,7 @@ validate() {
   "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx; do
+    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra vlc xterm; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
   '
@@ -1902,6 +2316,17 @@ int main(void) { puts("cross-alpine-ok"); return 0; }
 C_SOURCE
   "$CROSS_BIN/cross" /bin/sh -c "cd '$testdir' && cc hello.c -o hello && ./hello"
   rm -rf "$testdir"
+
+  info "Validating Cross Desktop, browser canvas, and VLC"
+  "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop start
+  "$CROSS_BIN/cross" /usr/local/libexec/cross-desktop status
+  "$CROSS_BIN/cross" /bin/sh -c '
+    test -x /usr/bin/vlc
+    test -f /usr/local/share/cross-desktop/www/manifest.webmanifest
+    test -f /usr/local/share/cross-desktop/www/sw.js
+    curl --silent --fail --max-time 3 http://127.0.0.1:'"$CROSS_DESKTOP_PORT"'/ \
+      | grep -q "Cross Desktop"
+  '
 }
 
 main() {
@@ -1920,6 +2345,7 @@ main() {
   configure_glibc_compat
   configure_chronos_user
   configure_cross_sudo
+  configure_cross_desktop
   write_ssh_service
   write_profile
   if (( BOOT_AUTOSTART_AVAILABLE )); then
@@ -1952,6 +2378,14 @@ the current ChromeOS kernel rejects apk v3 memfd hooks.
 
 Transport:
   crosh cross -> host ssh -> Cross service -> Alpine chroot
+
+Cross Desktop:
+  $CROSS_BIN/cross_desktop
+  http://cross-${CROSS_DESKTOP_UUID}.localhost:${CROSS_DESKTOP_PORT}
+
+  The X11-to-canvas session supports browser audio, clipboard synchronization,
+  file drag-and-drop and PWA installation. To start VLC:
+    cross_desktop vlc
 
 Activate wrappers:
   source ~/.bashrc

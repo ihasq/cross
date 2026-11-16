@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.50-desktop-settings"
+SCRIPT_VERSION="2026-11-16.51-desktop-runtime"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -816,8 +816,8 @@ SUDOERS
 
 configure_cross_desktop() {
   info "Configuring Cross Desktop canvas service"
-  local uid gid host_home uuid_file www index_tmp
-  uid="$(id -u)"; gid="$(id -g)"; host_home="${HOME:-/home/chronos/user}"
+  local uid host_home uuid_file www index_tmp
+  uid="$(id -u)"; host_home="${HOME:-/home/chronos/user}"
   uuid_file="$CROSS_ETC/desktop.uuid"
   www="$CROSS_ROOT/usr/local/share/cross-desktop/www"
 
@@ -836,15 +836,11 @@ configure_cross_desktop() {
   [[ -f "$CROSS_ROOT/usr/share/xpra/www/index.html" ]] \
     || die "xpra-webclient did not install its HTML5 client"
   sudo rm -rf "$CROSS_ROOT/usr/local/share/cross-desktop"
-  sudo mkdir -p "$www" "$CROSS_ROOT/usr/local/bin" "$CROSS_ROOT/usr/local/libexec" \
-    "$CROSS_ROOT/run/user/$uid"
+  sudo mkdir -p "$www" "$CROSS_ROOT/usr/local/bin" "$CROSS_ROOT/usr/local/libexec"
   sudo cp -a "$CROSS_ROOT/usr/share/xpra/www/." "$www/"
   # The package ships pre-compressed copies. They must not shadow the branded
   # index and PWA files below.
   sudo find "$www" -type f -name '*.gz' -delete
-  sudo chown "$uid:$gid" "$CROSS_ROOT/run/user/$uid"
-  sudo chmod 0700 "$CROSS_ROOT/run/user/$uid"
-
   cat <<MANIFEST | sudo tee "$www/manifest.webmanifest" >/dev/null
 {
   "id": "/",
@@ -1599,7 +1595,15 @@ prepare_mounts() {
   mount_bind /sys "$CROSS_ROOT/sys" 1
   mount_home_executable
   mount_bind "$CROSS_WORK" "$CROSS_ROOT$CROSS_WORK" 0
-  sudo mkdir -p "$CROSS_ROOT/run" "$CROSS_ROOT/var/log" "$CROSS_ROOT/run/sshd"
+  # /run was temporarily bind-mounted from ChromeOS while packages were being
+  # installed, but runtime services use Alpine's own /run. Recreate the
+  # per-user directory on every service start, after all setup binds are gone.
+  sudo mkdir -p "$CROSS_ROOT/run/user/$HOST_UID" "$CROSS_ROOT/var/log" \
+    "$CROSS_ROOT/run/sshd"
+  sudo chown root:root "$CROSS_ROOT/run" "$CROSS_ROOT/run/user"
+  sudo chmod 0755 "$CROSS_ROOT/run" "$CROSS_ROOT/run/user"
+  sudo chown "$HOST_UID:$HOST_GID" "$CROSS_ROOT/run/user/$HOST_UID"
+  sudo chmod 0700 "$CROSS_ROOT/run/user/$HOST_UID"
   ensure_chroot_exec
   if ! probe_home_exec direct >/dev/null 2>&1; then
     die "HOME ELF execution failed despite exec bind mount. Check ChromeOS LSM, filesystem and mount flags"

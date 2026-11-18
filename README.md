@@ -37,7 +37,7 @@ environment includes:
 - GCC, binutils, musl headers, CMake, Meson, Samurai, Autoconf, Automake, and
   Libtool
 - Rust, Cargo, rustup, rustfmt, and Clippy
-- Node.js, npm, npx, and Corepack
+- Node.js, npm, and npx
 - Common development libraries such as OpenSSL, zlib, SQLite, libffi, libxml2,
   libxslt, libarchive, libssh2, and libuv
 - Cross Desktop, an Xpra-backed X11-to-canvas layer with VLC, browser audio,

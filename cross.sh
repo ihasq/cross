@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-16.56-cross-desktop"
+SCRIPT_VERSION="2026-11-18.57-no-corepack"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1819,7 +1819,6 @@ resolve_cross_tool() {
     node)             printf '%s\n' /usr/bin/node ;;
     npm)              printf '%s\n' /usr/bin/npm ;;
     npx)              printf '%s\n' /usr/bin/npx ;;
-    corepack)         printf '%s\n' /usr/bin/corepack ;;
     python3)          printf '%s\n' /usr/bin/python3 ;;
     sudo)             printf '%s\n' /usr/bin/sudo ;;
     *) return 1 ;;
@@ -2712,7 +2711,6 @@ OPEN_CLIENT
     'node:/usr/bin/node'
     'npm:/usr/bin/npm'
     'npx:/usr/bin/npx'
-    'corepack:/usr/bin/corepack'
     'python3:/usr/bin/python3'
   )
 
@@ -2721,6 +2719,10 @@ OPEN_CLIENT
   # updates depend on the service that the installer must stop. Remove files
   # left by releases that generated wrappers for them.
   rm -f "$CROSS_BIN/bash" "$CROSS_BIN/sh" "$CROSS_BIN/curl" "$CROSS_BIN/wget"
+
+  # Corepack is not part of the default toolset. Remove the host wrapper left
+  # by releases that exposed it even though Alpine's npm package does not.
+  rm -f "$CROSS_BIN/corepack"
 
   for spec in "${wrapper_specs[@]}"; do
     cmd="${spec%%:*}"

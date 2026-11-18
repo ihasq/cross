@@ -193,9 +193,17 @@ All sessions are routed through the loopback-only port:
 http://cross-{uuid}.localhost:32221
 ```
 
-The command prints the application's concrete URL and opens it through ChromeOS's
-`org.chromium.UrlHandlerService` system D-Bus service. Set
-`CROSS_DESKTOP_OPEN=0` to print the URL without opening a browser. The canvas
+The command prints the application's concrete URL and asks ChromeOS to open it
+through the `org.chromium.UrlHandlerService` system D-Bus service. Crosh-side
+launches send the request from the host, while the Cross Desktop launcher can
+use the exposed bus socket for launches made from an interactive Cross shell:
+
+```bash
+cross
+cross_desktop mousepad README.md
+```
+
+Set `CROSS_DESKTOP_OPEN=0` to print the URL without opening a browser. The canvas
 fills the whole page with one application's main window; dialogs remain layered
 over that window. Each origin exposes a separate webmanifest using the
 application's name and icon, so VLC, Mousepad, XTerm and other applications can
@@ -305,14 +313,20 @@ to the browser. Cross forces common Wayland-capable toolkits onto their X11
 backend for this virtual display (`QT_QPA_PLATFORM=xcb`, `GDK_BACKEND=x11`), so
 the layer does not depend on the ChromeOS display server.
 
+At runtime Cross bind-mounts only ChromeOS's
+`/run/dbus/system_bus_socket` into Alpine's otherwise private `/run`. An
+explicit GUI launch uses it to call `org.chromium.UrlHandlerService.OpenUrl`;
+background session restoration does not open browser pages.
+
 The SSH daemon listens only on `127.0.0.1` and accepts the dedicated key created
 by the installer. Arbitrary SSH forwarding is disabled. The forced session
 selects the requested Alpine tool and preserves only supported working
 directories.
 
-Cross is a chroot, not a security boundary. Processes with root access inside
-the environment can affect the mounted host home directory and the Cross
-installation.
+Cross is a chroot, not a security boundary. Processes inside the environment
+run with the ChromeOS user's access to the exposed system D-Bus socket, and
+processes with root access can affect the mounted host home directory and the
+Cross installation.
 
 ## Service management
 

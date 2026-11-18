@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-18.57-no-corepack"
+SCRIPT_VERSION="2026-11-18.58-dbus-canvas-open"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -123,6 +123,8 @@ Cross is a successor project to Chromebrew. By accepting, you agree:
 7. Cross Desktop adds a localhost-only Xpra HTTP/WebSocket service on port
    32221. Its browser client can exchange clipboard contents and files with the
    Alpine session, and dropped media files may be opened automatically in VLC.
+   The ChromeOS system D-Bus socket is exposed inside Alpine so an explicitly
+   launched GUI application can ask ChromeOS to open its browser canvas.
 
 8. Acceptance authorizes the operations above. Otherwise setup will exit.
 CROSS_EULA
@@ -1322,6 +1324,7 @@ ROUTES_FILE="$STATE_DIR/routes.tsv"
 ROUTER_PID_FILE="$XDG_RUNTIME_DIR/cross-desktop-router.pid"
 ROUTER_LOG="$STATE_DIR/router.log"
 SOCKET_DIR="$XDG_RUNTIME_DIR/xpra"
+declare -A CANVAS_OPEN_REQUESTS=()
 
 die() { printf 'cross desktop: ERROR: %s\n' "$*" >&2; exit 1; }
 pid_running() {
@@ -1457,6 +1460,26 @@ ensure_app() {
 app_url() {
   printf 'http://cross-%s.localhost:%s\n' "$(<"$1/uuid")" "$ROUTER_PORT"
 }
+open_canvas_on_chromeos() {
+  local url=$1 reply
+  [[ "${CROSS_DESKTOP_OPEN:-1}" != 0 ]] || return 0
+  [[ -z "${CANVAS_OPEN_REQUESTS[$url]+requested}" ]] || return 0
+  CANVAS_OPEN_REQUESTS[$url]=1
+  if [[ ! -S /run/dbus/system_bus_socket ]]; then
+    printf 'cross desktop: WARN: ChromeOS system D-Bus socket is unavailable; open %s manually\n' \
+      "$url" >&2
+    return 1
+  fi
+  if ! reply=$(/usr/bin/dbus-send --system --type=method_call --print-reply \
+      --dest=org.chromium.UrlHandlerService \
+      /org/chromium/UrlHandlerService \
+      org.chromium.UrlHandlerServiceInterface.OpenUrl \
+      "string:$url" 2>&1); then
+    printf 'cross desktop: WARN: ChromeOS rejected canvas URL %s\n%s\n' \
+      "$url" "$reply" >&2
+    return 1
+  fi
+}
 start_router() {
   local pid attempt
   prepare
@@ -1571,7 +1594,7 @@ launch_restore_command() {
 }
 launch_for_app() {
   local application_key=$1; shift
-  local executable display name
+  local executable display name url
   executable="$(resolve_executable "$application_key")"
   ensure_app_session "$executable"
   display="$(<"$APP_DIR/display")"
@@ -1580,7 +1603,9 @@ launch_for_app() {
   /usr/bin/xpra control --socket-dir="$SOCKET_DIR" -- ":$display" \
     start-child /usr/local/libexec/cross-run-app "$PWD" "$@" >/dev/null
   printf 'Started %s in its Cross application session.\n' "$name"
-  app_url "$APP_DIR"
+  url="$(app_url "$APP_DIR")"
+  open_canvas_on_chromeos "$url" || true
+  printf '%s\n' "$url"
 }
 run_app() {
   local executable
@@ -1996,6 +2021,18 @@ mount_bind() {
   fi
 }
 
+mount_file_bind() {
+  local source="$1" target="$2"
+  [[ -e "$source" ]] || die "bind-mount source is missing: $source"
+  sudo mkdir -p "$(dirname -- "$target")"
+  if ! is_mounted "$target"; then
+    [[ ! -L "$target" ]] || die "refusing symlinked bind-mount target: $target"
+    if [[ ! -e "$target" ]]; then sudo touch "$target"; fi
+    [[ -f "$target" ]] || die "bind-mount target is not a file: $target"
+    sudo mount --bind "$source" "$target"
+  fi
+}
+
 mount_proc() {
   local target="$1"
   sudo mkdir -p "$target"
@@ -2181,6 +2218,14 @@ prepare_mounts() {
   sudo chmod 0755 "$CROSS_ROOT/run" "$CROSS_ROOT/run/user"
   sudo chown "$HOST_UID:$HOST_GID" "$CROSS_ROOT/run/user/$HOST_UID"
   sudo chmod 0700 "$CROSS_ROOT/run/user/$HOST_UID"
+  # Keep Alpine's private /run, but expose the ChromeOS system bus socket so a
+  # GUI launch can request its localhost canvas through UrlHandlerService.
+  [[ -S /run/dbus/system_bus_socket ]] \
+    || die "ChromeOS system D-Bus socket is unavailable"
+  mount_file_bind /run/dbus/system_bus_socket \
+    "$CROSS_ROOT/run/dbus/system_bus_socket"
+  [[ -S "$CROSS_ROOT/run/dbus/system_bus_socket" ]] \
+    || die "ChromeOS system D-Bus socket bind mount failed"
   ensure_chroot_exec
   if ! probe_home_exec direct >/dev/null 2>&1; then
     die "HOME ELF execution failed despite exec bind mount. Check ChromeOS LSM, filesystem and mount flags"
@@ -2211,6 +2256,7 @@ unmount_runtime() {
   for target in \
     "$CROSS_ROOT$CROSS_WORK" \
     "$CROSS_ROOT$HOST_HOME" \
+    "$CROSS_ROOT/run/dbus/system_bus_socket" \
     "$CROSS_ROOT/run" \
     "$CROSS_ROOT/sys" \
     "$CROSS_ROOT/proc" \
@@ -2528,9 +2574,19 @@ open_browser() {
   "$SELF_DIR/cross-open-url" "$1"
 }
 run_and_open() {
-  local output status url
+  local output status url suppress_remote_open=0
+  case "${1:-}" in
+    run|open) suppress_remote_open=1 ;;
+  esac
   set +e
-  output=$("$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@")
+  if (( suppress_remote_open )); then
+    # This Crosh-side launcher opens the returned URL itself. Suppress the
+    # Alpine-side notification so one application launch creates one tab.
+    output=$("$SELF_DIR/cross" /usr/bin/env CROSS_DESKTOP_OPEN=0 \
+      /usr/local/libexec/cross-desktop "$@")
+  else
+    output=$("$SELF_DIR/cross" /usr/local/libexec/cross-desktop "$@")
+  fi
   status=$?
   set -e
   [[ -z "$output" ]] || printf '%s\n' "$output"
@@ -3018,9 +3074,10 @@ validate() {
   "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra dbus-launch vlc gimp xterm; do
+    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra dbus-launch dbus-send vlc gimp xterm; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
+    test -S /run/dbus/system_bus_socket
   '
   "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
   "$CROSS_BIN/cross" /bin/sh -c '

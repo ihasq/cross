@@ -261,7 +261,8 @@ When a canvas first opens, click it or press a key once. Cross uses that browser
 gesture to focus the application's X11 window, enable keyboard capture, and
 unlock Chrome audio playback. The hint disappears after activation. Cross also
 backports Xpra's legacy HTML5 keymap initialization needed by Alpine 3.24's
-Xpra 6.4 server.
+Xpra 6.4 server. The Xpra and ChromeOS software keyboards remain closed unless
+the user explicitly requests one.
 
 ### Working directories
 

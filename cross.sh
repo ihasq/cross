@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-18.59-desktop-input-audio"
+SCRIPT_VERSION="2026-11-18.60-no-software-keyboard"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1005,6 +1005,8 @@ PWA
   sudo sed -i \
     -e 's#<title>[^<]*</title>#<title>Cross Desktop</title>#' \
     -e 's#content="xpra websockets client"#content="Cross Desktop"#' \
+    -e 's#<textarea id="pasteboard" readonly #<textarea id="pasteboard" readonly inputmode="none" virtualkeyboardpolicy="manual" #' \
+    -e 's#<div class="simple-keyboard" style="display: block;#<div class="simple-keyboard" style="display: none;#' \
     "$www/index.html"
   # Alpine packages this path as an absolute symlink into /etc/xpra. Since the
   # web root is being assembled from outside the chroot, replace the copied
@@ -1012,7 +1014,7 @@ PWA
   sudo rm -f "$www/default-settings.txt"
   cat <<'SETTINGS' | sudo tee "$www/default-settings.txt" >/dev/null
 # Cross Desktop HTML5 defaults
-keyboard = true
+keyboard = false
 clipboard = true
 file_transfer = true
 sound = true
@@ -1051,6 +1053,12 @@ APP_CSS
   cat <<'APP_JS' | sudo tee "$www/cross-app.js" >/dev/null
 (() => {
   const fitted = new Set();
+  const suppressSoftwareKeyboard = () => {
+    const pasteboard = document.getElementById("pasteboard");
+    if (!pasteboard) return;
+    pasteboard.setAttribute("inputmode", "none");
+    pasteboard.setAttribute("virtualkeyboardpolicy", "manual");
+  };
   const getXpraClient = () => {
     try {
       return typeof client === "undefined" ? globalThis.client : client;
@@ -1122,8 +1130,12 @@ APP_CSS
     document.body.append(hint);
   };
   if (document.readyState === "loading") {
-    addEventListener("DOMContentLoaded", showInputHint, {once: true});
+    addEventListener("DOMContentLoaded", () => {
+      suppressSoftwareKeyboard();
+      showInputHint();
+    }, {once: true});
   } else {
+    suppressSoftwareKeyboard();
     showInputHint();
   }
   addEventListener("pointerdown", activateInputAndAudio, true);
@@ -3281,9 +3293,15 @@ C_SOURCE
     test -f /usr/local/share/cross-desktop/www/sw.js
     test -f /usr/local/share/cross-desktop/www/cross-app.js
     test -f /usr/local/share/cross-desktop/www/cross-app.css
-    grep -Fqx "keyboard = true" \
+    grep -Fq "virtualkeyboardpolicy=\"manual\"" \
+      /usr/local/share/cross-desktop/www/index.html
+    grep -Fq "class=\"simple-keyboard\" style=\"display: none;" \
+      /usr/local/share/cross-desktop/www/index.html
+    grep -Fqx "keyboard = false" \
       /usr/local/share/cross-desktop/www/default-settings.txt
     grep -Fq "activateInputAndAudio" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq "virtualkeyboardpolicy" \
       /usr/local/share/cross-desktop/www/cross-app.js
     grep -Fq -- "--audio-source=pulse" /usr/local/libexec/cross-desktop
     grep -Fq -- "--aout=pulse" /usr/local/libexec/cross-vlc

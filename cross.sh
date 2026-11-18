@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-18.58-dbus-canvas-open"
+SCRIPT_VERSION="2026-11-18.59-desktop-input-audio"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -739,7 +739,7 @@ install_alpine_packages() {
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
-    xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good
+    xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good xkeyboard-config
     pulseaudio pulseaudio-utils dbus dbus-x11 xdg-utils shared-mime-info
     vlc vlc-qt gimp xterm pcmanfm gvfs mousepad ristretto mupdf-x11 font-dejavu
   )
@@ -751,6 +751,65 @@ install_alpine_packages() {
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/update-ca-certificates || true
   sudo mkdir -p "$CROSS_ROOT/usr/local/bin"
   sudo ln -sfn /usr/bin/rustup-init "$CROSS_ROOT/usr/local/bin/rustup"
+}
+
+configure_xpra_keyboard_compat() {
+  info "Backporting Xpra HTML5 keyboard-map initialization"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/python3 - <<'PYTHON_XPRA_KEYBOARD'
+from pathlib import Path
+
+matches = list(Path("/usr/lib").glob(
+    "python*/site-packages/xpra/x11/server/keyboard_config.py"
+))
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected one Xpra keyboard_config.py, found {len(matches)}: {matches}"
+    )
+
+path = matches[0]
+source = path.read_text(encoding="utf-8")
+if "def map_all_keynames(self)" in source:
+    raise SystemExit(0)
+
+init_needle = "        self.keyval_mappings = {}\n\n        self.compute_modifiers(True)"
+if source.count(init_needle) != 1:
+    raise SystemExit("Xpra keyboard initializer has an unexpected layout")
+source = source.replace(
+    init_needle,
+    "        self.keyval_mappings = {}\n\n"
+    "        # Cross backport of Xpra aa0e76a for legacy HTML5 clients.\n"
+    "        with xlog:\n"
+    "            self.map_all_keynames()\n"
+    "        self.compute_modifiers(True)",
+)
+
+legacy_call = "self.add_gtk_keynames()"
+if source.count(legacy_call) != 3:
+    raise SystemExit("Xpra keymap call sites have an unexpected layout")
+source = source.replace(legacy_call, "self.map_all_keynames()")
+
+method_needle = "    def add_gtk_keynames(self) -> None:\n"
+if source.count(method_needle) != 1:
+    raise SystemExit("Xpra keyboard helper insertion point was not found")
+method = '''    def map_all_keynames(self) -> None:
+        # Populate translations before legacy HTML5 clients send key events.
+        keycode_to_keynames = get_keycode_mappings()
+        default_for_keyname: dict[str, tuple[str | int, int]] = {}
+        for keycode, keynames in keycode_to_keynames.items():
+            for index, keyname in enumerate(keynames):
+                self.keycode_translation[(keyname, index)] = keycode
+                current = default_for_keyname.get(keyname)
+                if current is None or current[1] > index:
+                    default_for_keyname[keyname] = (keycode, index)
+        for keyname, current in default_for_keyname.items():
+            if not self.keycode_translation.get(keyname):
+                self.keycode_translation[keyname] = current[0]
+
+'''
+source = source.replace(method_needle, method + method_needle)
+compile(source, str(path), "exec")
+path.write_text(source, encoding="utf-8")
+PYTHON_XPRA_KEYBOARD
 }
 
 # npm's prebuilt workerd binaries use the glibc ELF interpreter. Alpine's
@@ -953,6 +1012,7 @@ PWA
   sudo rm -f "$www/default-settings.txt"
   cat <<'SETTINGS' | sudo tee "$www/default-settings.txt" >/dev/null
 # Cross Desktop HTML5 defaults
+keyboard = true
 clipboard = true
 file_transfer = true
 sound = true
@@ -974,12 +1034,39 @@ html, body, #screen {
 #float_menu, #window_preview {
   display: none !important;
 }
+#cross-input-hint {
+  position: fixed;
+  z-index: 2147483647;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 999px;
+  color: #f8fafc;
+  background: rgba(15, 23, 42, 0.88);
+  font: 500 13px/1.3 sans-serif;
+  pointer-events: none;
+}
 APP_CSS
   cat <<'APP_JS' | sudo tee "$www/cross-app.js" >/dev/null
 (() => {
   const fitted = new Set();
+  const getXpraClient = () => {
+    try {
+      return typeof client === "undefined" ? globalThis.client : client;
+    } catch {
+      return globalThis.client;
+    }
+  };
+  const mainApplicationWindow = (xpra) => Object.entries(xpra.id_to_window || {})
+    .find(([, remote]) => {
+      if (!remote || remote.tray || remote.override_redirect) return false;
+      const metadata = remote.metadata || {};
+      const type = remote.windowtype || "NORMAL";
+      return !metadata["transient-for"] && (!type || type === "NORMAL");
+    });
   const fitApplicationWindow = () => {
-    const xpra = globalThis.client;
+    const xpra = getXpraClient();
     if (!xpra || !xpra.id_to_window) return;
     for (const [wid, remote] of Object.entries(xpra.id_to_window)) {
       if (!remote || fitted.has(wid) || remote.tray || remote.override_redirect) continue;
@@ -995,6 +1082,53 @@ APP_CSS
       }
     }
   };
+  const resumeContext = (context) => {
+    if (context && context.state === "suspended" && typeof context.resume === "function") {
+      context.resume().catch((error) => console.warn("Cross audio context resume failed:", error));
+    }
+  };
+  const activateInputAndAudio = () => {
+    const xpra = getXpraClient();
+    if (!xpra || !xpra.connected) return;
+
+    xpra.capture_keyboard = true;
+    const main = mainApplicationWindow(xpra);
+    if (main && xpra.focus !== Number(main[0]) && typeof xpra.set_focus === "function") {
+      xpra.set_focus(main[1]);
+    }
+
+    resumeContext(xpra.audio_context);
+    if (xpra.audio_enabled && xpra.audio_state !== "disabled") {
+      if (!xpra.audio && typeof xpra._sound_start_receiving === "function") {
+        try {
+          xpra._sound_start_receiving();
+        } catch (error) {
+          console.warn("Cross audio restart failed:", error);
+        }
+      }
+      if (xpra.audio && xpra.audio.paused) {
+        xpra.audio.play().catch((error) => console.warn("Cross audio unlock failed:", error));
+      }
+      resumeContext(xpra.audio_aurora_ctx && xpra.audio_aurora_ctx.context);
+    }
+
+    document.getElementById("cross-input-hint")?.remove();
+  };
+  const showInputHint = () => {
+    if (document.getElementById("cross-input-hint")) return;
+    const hint = document.createElement("div");
+    hint.id = "cross-input-hint";
+    hint.textContent = "Click or press a key to enable input and sound";
+    document.body.append(hint);
+  };
+  if (document.readyState === "loading") {
+    addEventListener("DOMContentLoaded", showInputHint, {once: true});
+  } else {
+    showInputHint();
+  }
+  addEventListener("pointerdown", activateInputAndAudio, true);
+  addEventListener("touchstart", activateInputAndAudio, true);
+  addEventListener("keydown", activateInputAndAudio, true);
   addEventListener("resize", fitApplicationWindow);
   setInterval(fitApplicationWindow, 150);
 })();
@@ -1194,11 +1328,18 @@ for pathname do
   lower=$(printf '%s' "$pathname" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
     *.3g2|*.3gp|*.aac|*.avi|*.flac|*.flv|*.m2ts|*.m4a|*.m4v|*.mkv|*.mov|*.mp3|*.mp4|*.mpeg|*.mpg|*.ogg|*.ogv|*.opus|*.ts|*.wav|*.webm|*.wmv)
-      exec /usr/bin/vlc --started-from-file "$pathname"
+      exec /usr/local/libexec/cross-vlc --started-from-file "$pathname"
       ;;
   esac
 done
 OPEN_FILE
+
+  cat <<'VLC_LAUNCHER' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-vlc" >/dev/null
+#!/bin/sh
+set -eu
+unset LD_PRELOAD
+exec /usr/bin/vlc --aout=pulse "$@"
+VLC_LAUNCHER
 
   cat <<'OPEN_TARGET' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-open-target" >/dev/null
 #!/bin/sh
@@ -1242,9 +1383,9 @@ case "$application" in
   /usr/bin/vlc)
     case "$target" in
   rtsp://*|rtsps://*|rtmp://*|rtmps://*|mms://*|mmsh://*|udp://*)
-        exec /usr/bin/vlc "$target"
+        exec /usr/local/libexec/cross-vlc "$target"
         ;;
-      *) exec /usr/bin/vlc --started-from-file "$target" ;;
+      *) exec /usr/local/libexec/cross-vlc --started-from-file "$target" ;;
     esac
     ;;
   *) exec "$application" "$target" ;;
@@ -1449,6 +1590,8 @@ ensure_app() {
     write_app_assets "$executable" "$app_dir"
     if [[ "$executable" == /usr/bin/gimp ]]; then
       printf '#!/bin/sh\nexec /usr/local/libexec/cross-gimp "$@"\n' > "$app_dir/open-file"
+    elif [[ "$executable" == /usr/bin/vlc ]]; then
+      printf '#!/bin/sh\nexec /usr/local/libexec/cross-vlc "$@"\n' > "$app_dir/open-file"
     else
       printf '#!/bin/sh\nexec %q "$@"\n' "$executable" > "$app_dir/open-file"
     fi
@@ -1530,6 +1673,7 @@ start_app_session() {
     --webcam=no \
     --audio=yes \
     --pulseaudio=yes \
+    --audio-source=pulse \
     --speaker=on \
     --microphone=disabled \
     --start-new-commands=yes \
@@ -1614,6 +1758,9 @@ run_app() {
   if [[ "$executable" == /usr/bin/gimp ]]; then
     shift
     launch_for_app "$executable" /usr/local/libexec/cross-gimp "$@"
+  elif [[ "$executable" == /usr/bin/vlc ]]; then
+    shift
+    launch_for_app "$executable" /usr/local/libexec/cross-vlc "$@"
   else
     launch_for_app "$executable" "$@"
   fi
@@ -1723,12 +1870,14 @@ DESKTOP
   sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
     "$CROSS_ROOT/usr/local/libexec/cross-gimp" \
+    "$CROSS_ROOT/usr/local/libexec/cross-vlc" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
   sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
     "$CROSS_ROOT/usr/local/libexec/cross-gimp" \
+    "$CROSS_ROOT/usr/local/libexec/cross-vlc" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
@@ -3124,11 +3273,25 @@ C_SOURCE
     test -x /usr/bin/ristretto
     test -x /usr/bin/mupdf-x11
     test -x /usr/local/libexec/cross-desktop-router
+    test -x /usr/local/libexec/cross-vlc
     test -x /usr/local/libexec/cross-open-target
+    grep -Rq "def map_all_keynames(self)" \
+      /usr/lib/python*/site-packages/xpra/x11/server/keyboard_config.py
     test -f /usr/local/share/cross-desktop/www/manifest.webmanifest
     test -f /usr/local/share/cross-desktop/www/sw.js
     test -f /usr/local/share/cross-desktop/www/cross-app.js
     test -f /usr/local/share/cross-desktop/www/cross-app.css
+    grep -Fqx "keyboard = true" \
+      /usr/local/share/cross-desktop/www/default-settings.txt
+    grep -Fq "activateInputAndAudio" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq -- "--audio-source=pulse" /usr/local/libexec/cross-desktop
+    grep -Fq -- "--aout=pulse" /usr/local/libexec/cross-vlc
+    for plugin in pulsesrc opusenc matroskamux; do
+      gst-inspect-1.0 "$plugin" >/dev/null
+    done
+    find /usr/lib/vlc/plugins -type f -name libpulse_plugin.so -print -quit \
+      | grep -q .
     curl --silent --fail --max-time 3 -H "Host: '"$desktop_host"'" \
       http://127.0.0.1:'"$CROSS_DESKTOP_PORT"'/manifest.webmanifest \
       | grep -q '"name":"XTerm"'
@@ -3151,6 +3314,7 @@ main() {
   download_and_extract_rootfs
   configure_rootfs
   install_alpine_packages
+  configure_xpra_keyboard_compat
   configure_glibc_compat
   configure_chronos_user
   configure_cross_sudo

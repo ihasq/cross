@@ -257,6 +257,12 @@ application's Alpine session and passes the files to the application. Clipboard
 exchange is enabled in both directions, subject to Chrome's clipboard
 permission and user-gesture rules.
 
+When a canvas first opens, click it or press a key once. Cross uses that browser
+gesture to focus the application's X11 window, enable keyboard capture, and
+unlock Chrome audio playback. The hint disappears after activation. Cross also
+backports Xpra's legacy HTML5 keymap initialization needed by Alpine 3.24's
+Xpra 6.4 server.
+
 ### Working directories
 
 When a command is launched from the ChromeOS home directory, Cross uses the
@@ -308,10 +314,13 @@ Chrome/PWA at cross-{uuid}.localhost:32221
 ```
 
 Xpra sends window updates to browser canvases and negotiates native browser
-video decoding where available. PulseAudio and GStreamer provide speaker audio
-to the browser. Cross forces common Wayland-capable toolkits onto their X11
-backend for this virtual display (`QT_QPA_PLATFORM=xcb`, `GDK_BACKEND=x11`), so
-the layer does not depend on the ChromeOS display server.
+video decoding where available. A private PulseAudio null sink and an explicit
+GStreamer PulseAudio capture source provide speaker audio to the browser; the
+VLC launcher is pinned to its PulseAudio output. Cross restarts a
+browser-blocked stream on the next canvas gesture. Cross forces common
+Wayland-capable toolkits onto their X11 backend for this virtual display
+(`QT_QPA_PLATFORM=xcb`, `GDK_BACKEND=x11`), so the layer does not depend on the
+ChromeOS display server.
 
 At runtime Cross bind-mounts only ChromeOS's
 `/run/dbus/system_bus_socket` into Alpine's otherwise private `/run`. An
@@ -449,7 +458,7 @@ Verify that ChromeOS itself has network access, then rerun the installer. Cross
 copies a usable host DNS configuration into Alpine during setup and validates
 resolution before completing.
 
-### Cross Desktop does not open or has no audio
+### Cross Desktop has no audio or keyboard input
 
 Check the canvas service and its Xpra/PulseAudio log:
 
@@ -458,10 +467,11 @@ cross desktop status
 cross desktop log 120
 ```
 
-If the main Cross service is stopped, start it from VT-2 first. Chrome may
-require one click in the canvas before it allows audio playback or clipboard
-access. `cross desktop restart` recreates the virtual display and its private
-PulseAudio server.
+If the main Cross service is stopped, start it from VT-2 first. Click the canvas
+or press a key once when the activation hint appears; this focuses the X11
+window and satisfies Chrome's audio user-gesture requirement. If input or audio
+still fails, `cross desktop restart` recreates the virtual display and its
+private PulseAudio server.
 
 ### Boot autostart requires a reboot and rerun
 

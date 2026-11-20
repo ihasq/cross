@@ -29,8 +29,8 @@ installing for the security implications and complete setup instructions.
 ## What Cross installs
 
 Cross bootstraps an Alpine minirootfs with SHA-256 verification, installs
-signed development packages from the official Alpine repositories, and adds a
-checksum-pinned glibc runtime from Debian Snapshot. The default environment
+signed development packages from the official Alpine repositories, and adds
+the latest SHA-256-verified glibc runtime from Debian. The default environment
 includes:
 
 - Bash, Git, curl, OpenSSH, Nano, Vim, FFmpeg, and standard GNU command-line
@@ -39,17 +39,18 @@ includes:
   Libtool
 - Rust, Cargo, rustup, rustfmt, and Clippy
 - Node.js, npm, and npx
-- GNU libc 2.44 runtime compatibility for x86_64 and aarch64 binaries
+- The latest GNU libc runtime compatibility for x86_64 and aarch64 binaries
 - Common development libraries such as OpenSSL, zlib, SQLite, libffi, libxml2,
   libxslt, libarchive, libssh2, and libuv
 - Cross Desktop, an Xpra-backed X11-to-canvas layer with VLC, browser audio,
   clipboard synchronization, file drag-and-drop, and PWA metadata
 
 Cross does not build third-party tools from source. Alpine remains musl-based,
-but checksum-pinned Debian Snapshot packages install the GNU libc 2.44 runtime
-in a non-conflicting multiarch directory. This lets glibc-linked binaries such
-as `workerd` run with a real glibc loader without replacing Alpine's system
-libc.
+but each setup run resolves the latest stable version from GNU, requires an
+exact matching Debian experimental package, and verifies the index-provided
+SHA-256 checksums. The packages are installed in a non-conflicting multiarch
+directory, letting glibc-linked binaries such as `workerd` run with a real
+glibc loader without replacing Alpine's system libc.
 
 ## Requirements
 
@@ -58,7 +59,7 @@ libc.
 - Access to VT-2 as the `chronos` user
 - `sudo`, `tar`, OpenSSH, and either curl or wget on the ChromeOS host
 - At least 1.2 GiB free under `/usr/local`
-- An internet connection to the Alpine package repositories and Debian Snapshot
+- An internet connection to the Alpine, Debian, and GNU package repositories
 
 Disabling hardware write protection is not necessary. Boot autostart does,
 however, require a writable `/etc/init`. On stock ChromeOS release images the
@@ -96,9 +97,9 @@ required ChromeOS facilities are absent or reject the change, setup likewise
 continues without autostart instead of failing.
 
 The setup run downloads Alpine packages with up to six concurrent downloads
-and shows a per-package progress indicator. It also downloads the pinned glibc
-runtime, installs the toolchains, creates SSH keys, starts the local service,
-and runs a smoke test. A setup log is written to:
+and shows a per-package progress indicator. It also resolves and downloads the
+latest glibc runtime, installs the toolchains, creates SSH keys, starts the
+local service, and runs a smoke test. A setup log is written to:
 
 ```text
 ~/cross-setup-YYYYMMDD-HHMMSS.log

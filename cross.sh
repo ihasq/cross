@@ -2,7 +2,7 @@
 # cross.sh - Alpine-based development environment for ChromeOS Developer Mode.
 #
 # No third-party source builds, containers, VMs, or mount namespaces. Alpine executes in a
-# chroot and is reached over a VT-2-started, localhost-only OpenSSH service. A pinned Debian
+# chroot and is reached over a VT-2-started, localhost-only OpenSSH service. The latest Debian
 # glibc runtime coexists with musl so prebuilt glibc-linked programs can run.
 # The ChromeOS HOME is bind-mounted at the same path. The *bind mount only* is
 # remounted with exec, so HOME-resident ELF programs (e.g. cargo run output or
@@ -20,12 +20,12 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-20.62-glibc-tar-path"
+SCRIPT_VERSION="2026-11-20.63-latest-glibc"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
-GLIBC_VERSION="2.44"
-GLIBC_DEBIAN_VERSION="2.44-3"
+GLIBC_VERSION=""
+GLIBC_DEBIAN_VERSION=""
 INITIAL_DOWNLOAD_JOBS=6
 CROSS_PREFIX="${CROSS_PREFIX:-/usr/local/cross}"
 CROSS_ROOT="$CROSS_PREFIX/alpine"
@@ -735,8 +735,8 @@ install_alpine_packages() {
   info "Installing signed Alpine development packages"
   apk_chroot update
   local required=(
-    bash ca-certificates coreutils findutils diffutils grep sed gawk
-    tar gzip bzip2 xz file patch nano vim ffmpeg
+    bash ca-certificates coreutils findutils diffutils grep sed gawk python3
+    tar gzip bzip2 xz zstd file patch nano vim ffmpeg
     git git-init-template curl openssh-client openssh-server
     build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
@@ -815,43 +815,139 @@ path.write_text(source, encoding="utf-8")
 PYTHON_XPRA_KEYBOARD
 }
 
-# Install the current stable GNU libc alongside Alpine's musl. Debian's
-# multiarch library directory does not overlap Alpine's native /usr/lib, so
-# musl remains the system libc while glibc-linked binaries get a real loader.
-# Snapshot content hashes make these package URLs immutable; SHA-256 is checked
-# separately before anything is extracted into the rootfs.
+# Read one package record from a Debian Packages.xz index inside Alpine, where
+# Python and xz are guaranteed to exist after install_alpine_packages.
+read_debian_package_metadata() {
+  local index_path="$1" package="$2" architecture="$3"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/python3 - \
+    "$index_path" "$package" "$architecture" <<'PYTHON_DEBIAN_METADATA'
+import lzma
+import re
+import sys
+
+index_path, wanted_package, wanted_architecture = sys.argv[1:]
+matches = []
+fields = {}
+
+def finish_record():
+    if (fields.get("Package") == wanted_package and
+            fields.get("Architecture") == wanted_architecture):
+        matches.append(fields.copy())
+
+with lzma.open(index_path, mode="rt", encoding="utf-8") as stream:
+    for raw_line in stream:
+        line = raw_line.rstrip("\n")
+        if not line:
+            finish_record()
+            fields.clear()
+            continue
+        if line[0].isspace():
+            continue
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key] = value.lstrip()
+finish_record()
+
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected one {wanted_package}:{wanted_architecture} record, "
+        f"found {len(matches)}"
+    )
+
+record = matches[0]
+required = ("Version", "Filename", "SHA256")
+missing = [field for field in required if not record.get(field)]
+if missing:
+    raise SystemExit(f"{wanted_package} metadata lacks: {', '.join(missing)}")
+if not re.fullmatch(r"[0-9a-fA-F]{64}", record["SHA256"]):
+    raise SystemExit(f"invalid SHA256 for {wanted_package}")
+if not record["Filename"].startswith("pool/") or ".." in record["Filename"].split("/"):
+    raise SystemExit(f"unsafe Filename for {wanted_package}")
+
+print("\t".join(record[field] for field in required))
+PYTHON_DEBIAN_METADATA
+}
+
+# Install the newest glibc published for Debian experimental alongside
+# Alpine's musl. The multiarch library directory does not overlap Alpine's
+# native /usr/lib, so musl remains the system libc while glibc-linked binaries
+# get a real loader. Package checksums come from a freshly downloaded Debian
+# package index and are checked before extraction.
 install_glibc_runtime() {
-  local deb_arch multiarch loader runtime_snapshot gconv_snapshot
-  local runtime_sha256 gconv_sha256 runtime_deb gconv_deb package_dir actual
-  local glibc_report
+  local deb_arch multiarch loader releases_index latest_upstream
+  local packages_index package_dir index_chroot
+  local runtime_metadata gconv_metadata runtime_version gconv_version
+  local runtime_filename gconv_filename runtime_sha256 gconv_sha256
+  local runtime_deb gconv_deb actual glibc_report
 
   case "$ALPINE_ARCH" in
     x86_64)
       deb_arch="amd64"
       multiarch="x86_64-linux-gnu"
       loader="/lib64/ld-linux-x86-64.so.2"
-      runtime_snapshot="2c508bb2cae4021afb0363c215ccfc0a5ade6370"
-      gconv_snapshot="0225437d461e2a9b522aaca33e16bfc4acf6dd09"
-      runtime_sha256="09ceffb81fdc6fd33c01e672889f7a6c41671feb52b9cf34c33879228dcd9cc2"
-      gconv_sha256="7444dc8b630cf14de1d23db40ad3b6c586e71b6746f999e86bd003a050fbed62"
       ;;
     aarch64)
       deb_arch="arm64"
       multiarch="aarch64-linux-gnu"
       loader="/lib/ld-linux-aarch64.so.1"
-      runtime_snapshot="8399b67d50acdafd39091a23923447b90411241a"
-      gconv_snapshot="0a1190638c0a8b3a1ada93aceddd8ab92cc7b124"
-      runtime_sha256="cec5926afafdce6d1cbd926790c283673e6541b5007fdac0d6760ecc41276da7"
-      gconv_sha256="a6c9350e94b8585f86fc9d9d744d684579dc52cd7f9d1ce2bba7e0673352f299"
       ;;
     *) die "glibc runtime is unavailable for Alpine architecture: $ALPINE_ARCH" ;;
   esac
 
-  info "Installing GNU libc ${GLIBC_VERSION} runtime for ${deb_arch}"
-  runtime_deb="$CROSS_CACHE/libc6_${GLIBC_DEBIAN_VERSION}_${deb_arch}.deb"
-  gconv_deb="$CROSS_CACHE/libc-gconv-modules-extra_${GLIBC_DEBIAN_VERSION}_${deb_arch}.deb"
-  fetch "https://snapshot.debian.org/file/${runtime_snapshot}" "$runtime_deb"
-  fetch "https://snapshot.debian.org/file/${gconv_snapshot}" "$gconv_deb"
+  info "Resolving the latest stable GNU libc release for ${deb_arch}"
+  releases_index="$CROSS_CACHE/gnu-glibc-releases.html"
+  rm -f "$releases_index"
+  fetch "https://ftp.gnu.org/gnu/glibc/" "$releases_index"
+  latest_upstream="$(
+    { grep -oE 'glibc-[0-9]+\.[0-9]+\.tar\.xz' "$releases_index" || true; } \
+      | sed -E 's/^glibc-//; s/\.tar\.xz$//' \
+      | awk -F. '
+          $1 > major || ($1 == major && $2 > minor) {
+            major=$1; minor=$2
+          }
+          END {
+            if (major != "") print major "." minor
+          }
+        '
+  )"
+  [[ "$latest_upstream" =~ ^[0-9]+\.[0-9]+$ ]] \
+    || die "could not determine the latest stable GNU libc release"
+
+  packages_index="$CROSS_CACHE/debian-experimental-${deb_arch}-Packages.xz"
+  rm -f "$packages_index"
+  fetch "https://deb.debian.org/debian/dists/experimental/main/binary-${deb_arch}/Packages.xz" \
+    "$packages_index"
+
+  package_dir="$CROSS_ROOT/tmp/cross-glibc-packages"
+  index_chroot="/tmp/cross-glibc-packages/Packages.xz"
+  sudo rm -rf "$package_dir"
+  sudo mkdir -p "$package_dir"
+  sudo cp -f "$packages_index" "$CROSS_ROOT$index_chroot"
+
+  runtime_metadata="$(read_debian_package_metadata \
+    "$index_chroot" libc6 "$deb_arch")"
+  gconv_metadata="$(read_debian_package_metadata \
+    "$index_chroot" libc-gconv-modules-extra "$deb_arch")"
+  IFS=$'\t' read -r runtime_version runtime_filename runtime_sha256 \
+    <<<"$runtime_metadata"
+  IFS=$'\t' read -r gconv_version gconv_filename gconv_sha256 \
+    <<<"$gconv_metadata"
+  [[ "$runtime_version" == "$gconv_version" ]] \
+    || die "Debian glibc package versions do not match: libc6=$runtime_version, gconv=$gconv_version"
+
+  GLIBC_DEBIAN_VERSION="$runtime_version"
+  GLIBC_VERSION="${GLIBC_DEBIAN_VERSION#*:}"
+  GLIBC_VERSION="${GLIBC_VERSION%%-*}"
+  [[ "$GLIBC_VERSION" =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]] \
+    || die "unexpected Debian glibc version: $GLIBC_DEBIAN_VERSION"
+  [[ "$GLIBC_VERSION" == "$latest_upstream" ]] \
+    || die "latest stable glibc is ${latest_upstream}, but Debian experimental provides ${GLIBC_DEBIAN_VERSION}"
+
+  info "Installing GNU libc ${GLIBC_VERSION} (${GLIBC_DEBIAN_VERSION}) for ${deb_arch}"
+  runtime_deb="$CROSS_CACHE/${runtime_filename##*/}"
+  gconv_deb="$CROSS_CACHE/${gconv_filename##*/}"
+  fetch "https://deb.debian.org/debian/${runtime_filename}" "$runtime_deb"
+  fetch "https://deb.debian.org/debian/${gconv_filename}" "$gconv_deb"
 
   actual="$(sha256_file "$runtime_deb")"
   if [[ "${actual,,}" != "$runtime_sha256" ]]; then
@@ -870,9 +966,6 @@ install_glibc_runtime() {
   fi
   sudo rm -f "$CROSS_ROOT/usr/local/lib/cross-gcompat-resolver.so"
 
-  package_dir="$CROSS_ROOT/tmp/cross-glibc-packages"
-  sudo rm -rf "$package_dir"
-  sudo mkdir -p "$package_dir"
   sudo cp -f "$runtime_deb" "$package_dir/libc6.deb"
   sudo cp -f "$gconv_deb" "$package_dir/gconv.deb"
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/bash -c '
@@ -882,8 +975,24 @@ install_glibc_runtime() {
     tar_bin="$(command -v tar)"
     for package in /tmp/cross-glibc-packages/libc6.deb \
                    /tmp/cross-glibc-packages/gconv.deb; do
-      "$ar_bin" p "$package" data.tar.xz \
-        | "$tar_bin" -xJf - -C / \
+      data_member=""
+      while IFS= read -r member; do
+        case "$member" in
+          data.tar.xz|data.tar.gz|data.tar.bz2|data.tar.zst)
+            data_member="$member"
+            ;;
+        esac
+      done < <("$ar_bin" t "$package")
+      case "$data_member" in
+        data.tar.xz)  decompressor="$(command -v xz)" ;;
+        data.tar.gz)  decompressor="$(command -v gzip)" ;;
+        data.tar.bz2) decompressor="$(command -v bzip2)" ;;
+        data.tar.zst) decompressor="$(command -v zstd)" ;;
+        *) echo "unsupported Debian data archive in $package" >&2; exit 1 ;;
+      esac
+      "$ar_bin" p "$package" "$data_member" \
+        | "$decompressor" -dc \
+        | "$tar_bin" -xf - -C / \
             "./usr/lib/$multiarch" "./usr/share/doc"
     done
   ' cross-glibc-install "$multiarch"
@@ -3485,9 +3594,9 @@ main() {
   cat <<SUMMARY
 
 No third-party source packages were built. System tools and musl libraries came
-from Alpine ${ALPINE_BRANCH}; checksum-pinned Debian ${GLIBC_DEBIAN_VERSION}
-runtime packages provide GNU libc ${GLIBC_VERSION} alongside musl for
-glibc-linked binaries such as npm's workerd.
+from Alpine ${ALPINE_BRANCH}; the latest Debian experimental packages resolved
+at setup time (${GLIBC_DEBIAN_VERSION}) provide GNU libc ${GLIBC_VERSION}
+alongside musl for glibc-linked binaries such as npm's workerd.
 Transactions use Alpine apk-tools v2 static from ${APK_COMPAT_BRANCH} because
 the current ChromeOS kernel rejects apk v3 memfd hooks.
 

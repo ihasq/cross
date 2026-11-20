@@ -1404,6 +1404,44 @@ case "$application" in
 esac
 OPEN_TARGET
 
+  # Override Alpine's desktop-oriented xdg-open through /usr/local/bin.  The
+  # ChromeOS system bus socket is the only host runtime socket exposed in the
+  # chroot, so pass the target to ChromeOS's URL handler directly.  Do not
+  # impose a scheme allowlist here: custom application links are valid xdg-open
+  # inputs too, and ChromeOS remains responsible for accepting or rejecting
+  # them.
+  cat <<'XDG_OPEN' | sudo tee "$CROSS_ROOT/usr/local/bin/xdg-open" >/dev/null
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+  echo 'usage: xdg-open URL' >&2
+  exit 2
+fi
+url=$1
+
+unset LD_PRELOAD DBUS_SYSTEM_BUS_ADDRESS
+[ -S /run/dbus/system_bus_socket ] || {
+  echo 'xdg-open: ChromeOS system D-Bus socket is unavailable' >&2
+  exit 1
+}
+[ -x /usr/bin/dbus-send ] || {
+  echo 'xdg-open: dbus-send is unavailable' >&2
+  exit 1
+}
+
+if ! reply=$(/usr/bin/dbus-send --system --type=method_call --print-reply \
+    --dest=org.chromium.UrlHandlerService \
+    /org/chromium/UrlHandlerService \
+    org.chromium.UrlHandlerServiceInterface.OpenUrl \
+    "string:$url" 2>&1); then
+  printf 'xdg-open: ChromeOS rejected %s\n%s\n' "$url" "$reply" >&2
+  exit 1
+fi
+XDG_OPEN
+  sudo chown root:root "$CROSS_ROOT/usr/local/bin/xdg-open"
+  sudo chmod 0755 "$CROSS_ROOT/usr/local/bin/xdg-open"
+
   cat <<'GIMP_LAUNCHER' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-gimp" >/dev/null
 #!/bin/sh
 set -eu
@@ -2006,6 +2044,7 @@ resolve_cross_tool() {
     npm)              printf '%s\n' /usr/bin/npm ;;
     npx)              printf '%s\n' /usr/bin/npx ;;
     python3)          printf '%s\n' /usr/bin/python3 ;;
+    xdg-open)         printf '%s\n' /usr/local/bin/xdg-open ;;
     sudo)             printf '%s\n' /usr/bin/sudo ;;
     *) return 1 ;;
   esac
@@ -2929,6 +2968,7 @@ OPEN_CLIENT
     'npm:/usr/bin/npm'
     'npx:/usr/bin/npx'
     'python3:/usr/bin/python3'
+    'xdg-open:/usr/local/bin/xdg-open'
   )
 
   # These commands are part of the host-side bootstrap path. Shadowing them
@@ -3235,9 +3275,10 @@ validate() {
   "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra dbus-launch dbus-send vlc gimp xterm; do
+    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra dbus-launch dbus-send vlc gimp xterm xdg-open; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
+    test "$(command -v xdg-open)" = /usr/local/bin/xdg-open
     test -S /run/dbus/system_bus_socket
   '
   "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'

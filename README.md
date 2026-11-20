@@ -167,6 +167,18 @@ Mousepad, MuPDF, or PCManFM on the browser canvas. `open -a APPLICATION`
 selects an Alpine GUI command explicitly. Running `open` without arguments
 starts Cross Desktop and opens its canvas.
 
+Inside Cross, `xdg-open` sends its single link directly to ChromeOS's system
+D-Bus URL handler:
+
+```bash
+xdg-open https://example.com
+xdg-open 'my-app://open/item/42'
+```
+
+The bridge does not restrict URL schemes, so ChromeOS can dispatch custom
+application links as well as web links. The same command is also installed as
+a Crosh-side wrapper after reloading `~/.bashrc`.
+
 ### GUI applications
 
 Run GUI applications directly from Crosh. The command starts the application
@@ -325,8 +337,9 @@ ChromeOS display server.
 
 At runtime Cross bind-mounts only ChromeOS's
 `/run/dbus/system_bus_socket` into Alpine's otherwise private `/run`. An
-explicit GUI launch uses it to call `org.chromium.UrlHandlerService.OpenUrl`;
-background session restoration does not open browser pages.
+explicit GUI launch or `xdg-open URL` uses it to call
+`org.chromium.UrlHandlerService.OpenUrl`; background session restoration does
+not open browser pages.
 
 The SSH daemon listens only on `127.0.0.1` and accepts the dedicated key created
 by the installer. Arbitrary SSH forwarding is disabled. The forced session

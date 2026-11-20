@@ -43,7 +43,8 @@ includes:
 - Common development libraries such as OpenSSL, zlib, SQLite, libffi, libxml2,
   libxslt, libarchive, libssh2, and libuv
 - Cross Desktop, an Xpra-backed X11-to-canvas layer with VLC, browser audio,
-  clipboard synchronization, file drag-and-drop, and PWA metadata
+  clipboard synchronization, file drag-and-drop, PWA metadata, and transparent
+  routing of X11 applications started from a Cross shell
 
 Cross does not build third-party tools from source. Alpine remains musl-based,
 but each setup run resolves the latest stable version from GNU, requires an
@@ -186,13 +187,26 @@ a Crosh-side wrapper after reloading `~/.bashrc`.
 
 ### GUI applications
 
-Run GUI applications directly from Crosh. The command starts the application
-in its browser canvas and opens the corresponding Chrome page:
+Run GUI applications directly from Crosh or from an interactive Cross shell.
+The command starts the application in its browser canvas and opens the
+corresponding Chrome page:
 
 ```bash
 vlc ~/Downloads/movie.mp4
 gimp ~/Downloads/image.png
+
+cross
+/usr/bin/vlc ~/Downloads/movie.mp4
+/usr/bin/gimp ~/Downloads/image.png
 ```
+
+The commands inside Cross are ordinary executable launches: they do not need
+to be prefixed with `cross_desktop`. Cross gives every shell a synthetic X11
+display and routes each new X connection according to the connecting process.
+The first authenticated connection creates or selects that application's
+private Xpra session and opens its stable browser origin. Child processes and
+toolkit helpers inherit their parent application's route. A second X connection
+from the same launch does not open a duplicate tab.
 
 The `cross_desktop` command is also available for explicit application launches
 and session management:
@@ -321,7 +335,7 @@ Crosh command
   -> Alpine chroot
 ```
 
-The optional GUI path is:
+The GUI path is:
 
 ```text
 Chrome/PWA at cross-{uuid}.localhost:32221
@@ -330,6 +344,14 @@ Chrome/PWA at cross-{uuid}.localhost:32221
   -> dedicated virtual X11 display
   -> one Alpine GUI application (for example VLC)
 ```
+
+For an application launched normally inside Cross, the path begins at a local
+X11 multiplexer on display `:100`. It accepts both filesystem and Linux abstract
+X sockets, authenticates the client with a private MIT-MAGIC-COOKIE-1, obtains
+the peer PID with `SO_PEERCRED`, and selects the per-application display. It
+then rewrites only the X11 setup cookie and relays the connection in both
+directions. Ancillary `SCM_RIGHTS` messages are preserved, so DRI3 and other
+file-descriptor-carrying X11 extensions are not broken by the proxy.
 
 Xpra sends window updates to browser canvases and negotiates native browser
 video decoding where available. A private PulseAudio null sink and an explicit
@@ -435,6 +457,13 @@ the design include:
   the application's browser origin and PWA state; it
   is not a security boundary against other local processes, which can read or
   forge localhost traffic.
+- The synthetic X11 display uses Xauthority authentication. Its filesystem
+  socket lives under the Cross root, while its Linux abstract socket shares the
+  host kernel's socket namespace; a process still needs the private cookie to
+  complete X11 setup. The router reads same-user process metadata from `/proc`
+  to associate a connection with an executable. This association is an
+  application-routing mechanism, not isolation from other processes running as
+  the same user.
 - Enabling clipboard and file transfer exposes copied or dropped data to the
   Alpine session. Dropped media is opened automatically in VLC; other uploaded
   files are saved without automatic execution.
@@ -492,6 +521,23 @@ window and satisfies Chrome's audio user-gesture requirement. If input or audio
 still fails, `cross desktop restart` recreates the virtual display and its
 private PulseAudio server.
 
+### A GUI command inside Cross does not open a tab
+
+The tab is opened after the process completes an authenticated connection to
+the synthetic X display. Check that the shell has the expected display and that
+the multiplexer is running:
+
+```bash
+echo "$DISPLAY"                 # :100
+cross desktop status
+cross desktop log 120
+```
+
+`cross desktop restart` recreates the multiplexer and all registered private
+Xpra sessions. A program which never opens an X11 connection (for example, a
+second invocation that only signals an already-running singleton and exits)
+cannot itself trigger a new tab.
+
 ### Boot autostart requires a reboot and rerun
 
 This is expected on a stock ChromeOS release image. The first run completes
@@ -526,6 +572,7 @@ job and preserves the existing Alpine environment where possible.
 | Path | Purpose |
 | --- | --- |
 | `/usr/local/cross/alpine` | Alpine root filesystem |
+| `/usr/local/cross/alpine/usr/local/libexec/cross-x11-proxy` | authenticated X11 routing proxy |
 | `/usr/local/cross/bin` | `cross`, its compatibility helpers, and host wrappers |
 | `/usr/local/cross/cache` | Download cache |
 | `/usr/local/cross/etc` | Cross, default application UUID, and SSH client configuration |

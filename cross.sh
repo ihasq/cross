@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-20.64-xpra-startup"
+SCRIPT_VERSION="2026-11-20.65-x11-multiplexer"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -37,6 +37,7 @@ CROSS_LOG="$CROSS_PREFIX/log"
 CROSS_WORK="$CROSS_PREFIX/work"
 CROSS_SSH_PORT="${CROSS_SSH_PORT:-32222}"
 CROSS_DESKTOP_PORT="${CROSS_DESKTOP_PORT:-32221}"
+CROSS_X11_PROXY_DISPLAY="${CROSS_X11_PROXY_DISPLAY:-100}"
 CROSS_DESKTOP_UUID=""
 CROSS_MARKER="$CROSS_PREFIX/.alpine-cross-managed"
 CROSS_COMPLETE="$CROSS_PREFIX/.alpine-cross-complete"
@@ -127,7 +128,9 @@ Cross is a successor project to Chromebrew. By accepting, you agree:
    32221. Its browser client can exchange clipboard contents and files with the
    Alpine session, and dropped media files may be opened automatically in VLC.
    The ChromeOS system D-Bus socket is exposed inside Alpine so an explicitly
-   launched GUI application can ask ChromeOS to open its browser canvas.
+   launched GUI application can ask ChromeOS to open its browser canvas. A
+   local X11 proxy uses same-user process metadata from /proc to route normally
+   launched Alpine GUI applications to private Xpra displays automatically.
 
 8. Acceptance authorizes the operations above. Otherwise setup will exit.
 CROSS_EULA
@@ -411,6 +414,11 @@ preflight() {
     || die "CROSS_DESKTOP_PORT must be 1024..65535"
   [[ "$CROSS_DESKTOP_PORT" != "$CROSS_SSH_PORT" ]] \
     || die "CROSS_DESKTOP_PORT and CROSS_SSH_PORT must be different"
+  [[ "$CROSS_X11_PROXY_DISPLAY" =~ ^[0-9]+$ ]] &&
+    (( CROSS_X11_PROXY_DISPLAY >= 1 && CROSS_X11_PROXY_DISPLAY < 1000 )) \
+    || die "CROSS_X11_PROXY_DISPLAY must be 1..999"
+  (( CROSS_X11_PROXY_DISPLAY < 110 || CROSS_X11_PROXY_DISPLAY >= 310 )) \
+    || die "CROSS_X11_PROXY_DISPLAY must not overlap backend displays 110..309"
   opts="$(awk '$2 == "/usr/local" {print $4}' /proc/mounts | tail -n1)"
   [[ ",$opts," != *,noexec,* ]] || die "/usr/local is noexec"
   [[ ",$opts," != *,nosuid,* ]] || die "/usr/local nosuid; Alpine sudo needs setuid"
@@ -1678,12 +1686,597 @@ cd -- "$cwd" 2>/dev/null || cd -- "$HOME"
 exec "$@"
 RUN_APP
 
+  # Applications started directly from a Cross shell all connect to one
+  # synthetic X11 display.  This first-party multiplexer identifies the
+  # connecting process through SO_PEERCRED, asks cross-desktop for the
+  # application's dedicated Xpra display, substitutes the backend Xauthority
+  # cookie in the X11 setup packet, then relays the connection.  recvmsg and
+  # sendmsg are required here: modern DRI3 and MIT-SHM requests carry file
+  # descriptors in SCM_RIGHTS ancillary messages which a byte-only proxy would
+  # silently discard.
+  sudo mkdir -p "$CROSS_ROOT/usr/local/src/cross"
+  cat <<'X11_PROXY_C' | sudo tee \
+    "$CROSS_ROOT/usr/local/src/cross/cross-x11-proxy.c" >/dev/null
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define IO_BUFFER_SIZE (256 * 1024)
+#define CONTROL_BUFFER_SIZE CMSG_SPACE(sizeof(int) * 64)
+#define SETUP_LIMIT (64 * 1024)
+#define ROUTE_OUTPUT_LIMIT (64 * 1024)
+
+static volatile sig_atomic_t stopping;
+static char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static const char *router_path;
+static const char *cookie_path;
+
+static void log_error(const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    fputs("cross-x11-proxy: ", stderr);
+    vfprintf(stderr, format, arguments);
+    fputc('\n', stderr);
+    va_end(arguments);
+}
+
+static void stop_handler(int signal_number) {
+    (void) signal_number;
+    stopping = 1;
+}
+
+static void reap_handler(int signal_number) {
+    int saved_errno = errno;
+    (void) signal_number;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    errno = saved_errno;
+}
+
+static int create_listener(int display, bool abstract_socket) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    int written = snprintf(socket_path, sizeof(socket_path),
+                           "/tmp/.X11-unix/X%d", display);
+    if (written < 0 || (size_t) written >= sizeof(socket_path)) {
+        close(fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    socklen_t length;
+    if (abstract_socket) {
+        size_t path_length = strlen(socket_path);
+        address.sun_path[0] = '\0';
+        memcpy(address.sun_path + 1, socket_path, path_length);
+        length = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + path_length);
+    } else {
+        memcpy(address.sun_path, socket_path, strlen(socket_path) + 1);
+        length = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + strlen(socket_path) + 1);
+    }
+
+    if (bind(fd, (struct sockaddr *) &address, length) < 0 || listen(fd, 128) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!abstract_socket && chmod(socket_path, 0777) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        unlink(socket_path);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+static int hex_value(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static int decode_cookie(const char *hex, unsigned char output[16]) {
+    if (!hex || strlen(hex) != 32) return -1;
+    for (size_t index = 0; index < 16; index++) {
+        int high = hex_value(hex[index * 2]);
+        int low = hex_value(hex[index * 2 + 1]);
+        if (high < 0 || low < 0) return -1;
+        output[index] = (unsigned char) ((high << 4) | low);
+    }
+    return 0;
+}
+
+static int load_proxy_cookie(unsigned char cookie[16]) {
+    FILE *stream = fopen(cookie_path, "re");
+    if (!stream) return -1;
+    char line[128];
+    char *result = fgets(line, sizeof(line), stream);
+    fclose(stream);
+    if (!result) return -1;
+    line[strcspn(line, "\r\n")] = '\0';
+    return decode_cookie(line, cookie);
+}
+
+static int read_exact(int fd, void *buffer, size_t length) {
+    unsigned char *cursor = buffer;
+    while (length > 0) {
+        ssize_t count = recv(fd, cursor, length, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        cursor += (size_t) count;
+        length -= (size_t) count;
+    }
+    return 0;
+}
+
+static int write_exact(int fd, const void *buffer, size_t length) {
+    const unsigned char *cursor = buffer;
+    while (length > 0) {
+        ssize_t count = send(fd, cursor, length, MSG_NOSIGNAL);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        cursor += (size_t) count;
+        length -= (size_t) count;
+    }
+    return 0;
+}
+
+static uint16_t read_card16(const unsigned char *data, bool little_endian) {
+    if (little_endian) return (uint16_t) (data[0] | ((uint16_t) data[1] << 8));
+    return (uint16_t) (((uint16_t) data[0] << 8) | data[1]);
+}
+
+static size_t padded4(size_t value) {
+    return (value + 3U) & ~3U;
+}
+
+struct route {
+    int display;
+    char cookie[33];
+    char app_dir[PATH_MAX];
+    char token[128];
+};
+
+static int obtain_route(pid_t peer_pid, struct route *route) {
+    int pipe_fds[2];
+    if (pipe2(pipe_fds, O_CLOEXEC) < 0) return -1;
+    pid_t child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return -1;
+    }
+    if (child == 0) {
+        char pid_string[32];
+        snprintf(pid_string, sizeof(pid_string), "%ld", (long) peer_pid);
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(126);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        execl(router_path, router_path, "route-pid", pid_string, (char *) NULL);
+        _exit(127);
+    }
+    close(pipe_fds[1]);
+    char *output = calloc(1, ROUTE_OUTPUT_LIMIT + 1);
+    if (!output) {
+        close(pipe_fds[0]);
+        kill(child, SIGTERM);
+        waitpid(child, NULL, 0);
+        return -1;
+    }
+    size_t used = 0;
+    while (used < ROUTE_OUTPUT_LIMIT) {
+        ssize_t count = read(pipe_fds[0], output + used, ROUTE_OUTPUT_LIMIT - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        used += (size_t) count;
+    }
+    close(pipe_fds[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        free(output);
+        return -1;
+    }
+    output[used] = '\0';
+    char *line = output;
+    char *match = NULL;
+    while ((line = strstr(line, "CROSS_X11_ROUTE\t")) != NULL) {
+        match = line;
+        line++;
+    }
+    if (!match) {
+        free(output);
+        return -1;
+    }
+    char *end = strchr(match, '\n');
+    if (end) *end = '\0';
+    char *save = NULL;
+    (void) strtok_r(match, "\t", &save);
+    char *display = strtok_r(NULL, "\t", &save);
+    char *cookie = strtok_r(NULL, "\t", &save);
+    char *app_dir = strtok_r(NULL, "\t", &save);
+    char *token = strtok_r(NULL, "\t", &save);
+    if (!display || !cookie || !app_dir || !token || strtok_r(NULL, "\t", &save)) {
+        free(output);
+        return -1;
+    }
+    char *display_end = NULL;
+    long display_number = strtol(display, &display_end, 10);
+    if (!display_end || *display_end || display_number < 1 || display_number > INT_MAX ||
+        strlen(cookie) != 32 || strlen(app_dir) >= sizeof(route->app_dir) ||
+        strlen(token) >= sizeof(route->token)) {
+        free(output);
+        return -1;
+    }
+    route->display = (int) display_number;
+    memcpy(route->cookie, cookie, 33);
+    strcpy(route->app_dir, app_dir);
+    strcpy(route->token, token);
+    free(output);
+    return 0;
+}
+
+static int connect_backend(int display) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    int written = snprintf(address.sun_path, sizeof(address.sun_path),
+                           "/tmp/.X11-unix/X%d", display);
+    if (written < 0 || (size_t) written >= sizeof(address.sun_path) ||
+        connect(fd, (struct sockaddr *) &address,
+                (socklen_t) (offsetof(struct sockaddr_un, sun_path) +
+                             strlen(address.sun_path) + 1)) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+static void close_rights(int *rights, size_t count) {
+    for (size_t index = 0; index < count; index++) close(rights[index]);
+}
+
+struct relay_direction {
+    int source;
+    int destination;
+};
+
+static void *relay_stream(void *opaque) {
+    struct relay_direction *direction = opaque;
+    unsigned char *buffer = malloc(IO_BUFFER_SIZE);
+    if (!buffer) {
+        shutdown(direction->destination, SHUT_WR);
+        return NULL;
+    }
+    for (;;) {
+        union {
+            struct cmsghdr alignment;
+            unsigned char bytes[CONTROL_BUFFER_SIZE];
+        } input_control, output_control;
+        struct iovec input_iov = {.iov_base = buffer, .iov_len = IO_BUFFER_SIZE};
+        struct msghdr input = {
+            .msg_iov = &input_iov,
+            .msg_iovlen = 1,
+            .msg_control = input_control.bytes,
+            .msg_controllen = sizeof(input_control.bytes),
+        };
+        ssize_t count = recvmsg(direction->source, &input, MSG_CMSG_CLOEXEC);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        if (input.msg_flags & MSG_CTRUNC) {
+            log_error("ancillary data exceeded relay buffer");
+            break;
+        }
+
+        int rights[64];
+        size_t rights_count = 0;
+        for (struct cmsghdr *header = CMSG_FIRSTHDR(&input); header;
+             header = CMSG_NXTHDR(&input, header)) {
+            if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+                header->cmsg_len < CMSG_LEN(0)) continue;
+            size_t bytes = header->cmsg_len - CMSG_LEN(0);
+            size_t descriptors = bytes / sizeof(int);
+            if (descriptors > 64 - rights_count) {
+                int *overflow = (int *) CMSG_DATA(header);
+                close_rights(overflow, descriptors);
+                close_rights(rights, rights_count);
+                rights_count = 0;
+                log_error("too many file descriptors in X11 message");
+                count = -1;
+                break;
+            }
+            memcpy(rights + rights_count, CMSG_DATA(header), descriptors * sizeof(int));
+            rights_count += descriptors;
+        }
+        if (count < 0) break;
+
+        size_t offset = 0;
+        bool rights_sent = false;
+        while (offset < (size_t) count) {
+            ssize_t written;
+            if (!rights_sent && rights_count > 0) {
+                memset(&output_control, 0, sizeof(output_control));
+                struct iovec output_iov = {
+                    .iov_base = buffer + offset,
+                    .iov_len = (size_t) count - offset,
+                };
+                struct msghdr output = {
+                    .msg_iov = &output_iov,
+                    .msg_iovlen = 1,
+                    .msg_control = output_control.bytes,
+                    .msg_controllen = CMSG_SPACE(rights_count * sizeof(int)),
+                };
+                struct cmsghdr *header = CMSG_FIRSTHDR(&output);
+                header->cmsg_level = SOL_SOCKET;
+                header->cmsg_type = SCM_RIGHTS;
+                header->cmsg_len = CMSG_LEN(rights_count * sizeof(int));
+                memcpy(CMSG_DATA(header), rights, rights_count * sizeof(int));
+                written = sendmsg(direction->destination, &output, MSG_NOSIGNAL);
+            } else {
+                written = send(direction->destination, buffer + offset,
+                               (size_t) count - offset, MSG_NOSIGNAL);
+            }
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                if (!rights_sent) close_rights(rights, rights_count);
+                free(buffer);
+                shutdown(direction->destination, SHUT_WR);
+                return NULL;
+            }
+            if (!rights_sent && rights_count > 0) {
+                close_rights(rights, rights_count);
+                rights_sent = true;
+            }
+            offset += (size_t) written;
+        }
+        if (!rights_sent) close_rights(rights, rights_count);
+    }
+    free(buffer);
+    shutdown(direction->destination, SHUT_WR);
+    return NULL;
+}
+
+static void notify_application(const struct route *route) {
+    pid_t first = fork();
+    if (first < 0) return;
+    if (first == 0) {
+        pid_t second = fork();
+        if (second < 0) _exit(126);
+        if (second == 0) {
+            setsid();
+            execl(router_path, router_path, "proxy-notify",
+                  route->app_dir, route->token, (char *) NULL);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    while (waitpid(first, NULL, 0) < 0 && errno == EINTR) {}
+}
+
+static int proxy_setup(int client, int backend, const struct route *route) {
+    unsigned char proxy_cookie[16], backend_cookie[16];
+    if (load_proxy_cookie(proxy_cookie) < 0 ||
+        decode_cookie(route->cookie, backend_cookie) < 0) return -1;
+
+    unsigned char header[12];
+    if (read_exact(client, header, sizeof(header)) < 0) return -1;
+    bool little_endian;
+    if (header[0] == 'l') little_endian = true;
+    else if (header[0] == 'B') little_endian = false;
+    else return -1;
+    if (read_card16(header + 2, little_endian) != 11) return -1;
+    size_t name_length = read_card16(header + 6, little_endian);
+    size_t data_length = read_card16(header + 8, little_endian);
+    size_t remaining = padded4(name_length) + padded4(data_length);
+    if (remaining > SETUP_LIMIT) return -1;
+    unsigned char *setup = malloc(sizeof(header) + remaining);
+    if (!setup) return -1;
+    memcpy(setup, header, sizeof(header));
+    if (read_exact(client, setup + sizeof(header), remaining) < 0) {
+        free(setup);
+        return -1;
+    }
+    static const char auth_name[] = "MIT-MAGIC-COOKIE-1";
+    unsigned char *name = setup + sizeof(header);
+    unsigned char *data = name + padded4(name_length);
+    if (name_length != sizeof(auth_name) - 1 || data_length != 16 ||
+        memcmp(name, auth_name, sizeof(auth_name) - 1) != 0 ||
+        memcmp(data, proxy_cookie, 16) != 0) {
+        free(setup);
+        errno = EACCES;
+        return -1;
+    }
+    memcpy(data, backend_cookie, 16);
+    int result = write_exact(backend, setup, sizeof(header) + remaining);
+    free(setup);
+    if (result < 0) return -1;
+
+    unsigned char reply_header[8];
+    if (read_exact(backend, reply_header, sizeof(reply_header)) < 0) return -1;
+    size_t reply_remaining = (size_t) read_card16(reply_header + 6, little_endian) * 4U;
+    if (reply_remaining > SETUP_LIMIT) return -1;
+    unsigned char *reply = malloc(sizeof(reply_header) + reply_remaining);
+    if (!reply) return -1;
+    memcpy(reply, reply_header, sizeof(reply_header));
+    if (read_exact(backend, reply + sizeof(reply_header), reply_remaining) < 0 ||
+        write_exact(client, reply, sizeof(reply_header) + reply_remaining) < 0) {
+        free(reply);
+        return -1;
+    }
+    int success = reply_header[0] == 1 ? 0 : -1;
+    free(reply);
+    return success;
+}
+
+static void handle_client(int client) {
+    struct ucred credentials;
+    socklen_t credential_length = sizeof(credentials);
+    if (getsockopt(client, SOL_SOCKET, SO_PEERCRED,
+                   &credentials, &credential_length) < 0 ||
+        credential_length != sizeof(credentials) || credentials.uid != getuid()) {
+        log_error("rejected X11 connection with invalid peer credentials");
+        return;
+    }
+    struct route route;
+    memset(&route, 0, sizeof(route));
+    if (obtain_route(credentials.pid, &route) < 0) {
+        log_error("could not route X11 connection from pid %ld", (long) credentials.pid);
+        return;
+    }
+    int backend = connect_backend(route.display);
+    if (backend < 0) {
+        log_error("cannot connect pid %ld to display :%d: %s",
+                  (long) credentials.pid, route.display, strerror(errno));
+        return;
+    }
+    if (proxy_setup(client, backend, &route) < 0) {
+        log_error("X11 setup failed for pid %ld on display :%d: %s",
+                  (long) credentials.pid, route.display, strerror(errno));
+        close(backend);
+        return;
+    }
+    notify_application(&route);
+
+    struct relay_direction client_to_server = {.source = client, .destination = backend};
+    struct relay_direction server_to_client = {.source = backend, .destination = client};
+    pthread_t forward_thread, reverse_thread;
+    if (pthread_create(&forward_thread, NULL, relay_stream, &client_to_server) != 0) {
+        close(backend);
+        return;
+    }
+    if (pthread_create(&reverse_thread, NULL, relay_stream, &server_to_client) != 0) {
+        shutdown(client, SHUT_RDWR);
+        shutdown(backend, SHUT_RDWR);
+        pthread_join(forward_thread, NULL);
+        close(backend);
+        return;
+    }
+    pthread_join(forward_thread, NULL);
+    pthread_join(reverse_thread, NULL);
+    close(backend);
+}
+
+static void usage(const char *program) {
+    fprintf(stderr, "usage: %s DISPLAY COOKIE_FILE ROUTER\n", program);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        usage(argv[0]);
+        return 2;
+    }
+    char *end = NULL;
+    long display_long = strtol(argv[1], &end, 10);
+    if (!end || *end || display_long < 1 || display_long > INT_MAX) {
+        usage(argv[0]);
+        return 2;
+    }
+    cookie_path = argv[2];
+    router_path = argv[3];
+    unsigned char cookie_probe[16];
+    if (load_proxy_cookie(cookie_probe) < 0) {
+        log_error("invalid proxy cookie file: %s", cookie_path);
+        return 1;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    struct sigaction stop_action = {.sa_handler = stop_handler};
+    sigemptyset(&stop_action.sa_mask);
+    sigaction(SIGTERM, &stop_action, NULL);
+    sigaction(SIGINT, &stop_action, NULL);
+    struct sigaction reap_action = {.sa_handler = reap_handler, .sa_flags = SA_RESTART | SA_NOCLDSTOP};
+    sigemptyset(&reap_action.sa_mask);
+    sigaction(SIGCHLD, &reap_action, NULL);
+
+    int filesystem_listener = create_listener((int) display_long, false);
+    if (filesystem_listener < 0) {
+        log_error("cannot listen on display :%ld filesystem socket: %s",
+                  display_long, strerror(errno));
+        return 1;
+    }
+    int abstract_listener = create_listener((int) display_long, true);
+    if (abstract_listener < 0) {
+        log_error("cannot listen on display :%ld abstract socket: %s",
+                  display_long, strerror(errno));
+        close(filesystem_listener);
+        unlink(socket_path);
+        return 1;
+    }
+    fprintf(stderr, "cross-x11-proxy: listening on display :%ld\n", display_long);
+
+    while (!stopping) {
+        fd_set readers;
+        FD_ZERO(&readers);
+        FD_SET(filesystem_listener, &readers);
+        FD_SET(abstract_listener, &readers);
+        int maximum = filesystem_listener > abstract_listener ? filesystem_listener : abstract_listener;
+        struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+        int ready = select(maximum + 1, &readers, NULL, NULL, &timeout);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) break;
+        int listeners[2] = {filesystem_listener, abstract_listener};
+        for (size_t index = 0; index < 2; index++) {
+            if (!FD_ISSET(listeners[index], &readers)) continue;
+            int client = accept4(listeners[index], NULL, NULL, SOCK_CLOEXEC);
+            if (client < 0) continue;
+            pid_t child = fork();
+            if (child == 0) {
+                struct sigaction default_action = {.sa_handler = SIG_DFL};
+                sigemptyset(&default_action.sa_mask);
+                sigaction(SIGCHLD, &default_action, NULL);
+                close(filesystem_listener);
+                close(abstract_listener);
+                handle_client(client);
+                close(client);
+                _exit(0);
+            }
+            close(client);
+        }
+    }
+    close(filesystem_listener);
+    close(abstract_listener);
+    unlink(socket_path);
+    return 0;
+}
+X11_PROXY_C
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/cc \
+    -O2 -std=c11 -Wall -Wextra -Werror -pthread \
+    -o /usr/local/libexec/cross-x11-proxy \
+    /usr/local/src/cross/cross-x11-proxy.c
+
   cat <<'DESKTOP' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-desktop" >/dev/null
 #!/bin/bash
 set -Eeuo pipefail
 
 ROUTER_PORT=__CROSS_DESKTOP_PORT__
 DEFAULT_UUID=__CROSS_DESKTOP_UUID__
+PROXY_DISPLAY=__CROSS_X11_PROXY_DISPLAY__
 BACKEND_PORT_BASE=32300
 DISPLAY_BASE=110
 MAX_APPLICATIONS=200
@@ -1692,6 +2285,7 @@ export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 export QT_QPA_PLATFORM=xcb GDK_BACKEND=x11 SDL_VIDEODRIVER=x11
 export QT_X11_NO_MITSHM=1 LIBGL_ALWAYS_SOFTWARE=1
 unset LD_PRELOAD
@@ -1701,6 +2295,11 @@ APPS_DIR="$STATE_DIR/apps"
 ROUTES_FILE="$STATE_DIR/routes.tsv"
 ROUTER_PID_FILE="$XDG_RUNTIME_DIR/cross-desktop-router.pid"
 ROUTER_LOG="$STATE_DIR/router.log"
+PROXY_PID_FILE="$XDG_RUNTIME_DIR/cross-x11-proxy.pid"
+PROXY_LOG="$STATE_DIR/x11-proxy.log"
+PROXY_COOKIE_FILE="$STATE_DIR/x11-proxy.cookie"
+PROXY_PID_MAP="$STATE_DIR/proxy-pids"
+PROXY_SOCKET="/tmp/.X11-unix/X$PROXY_DISPLAY"
 SOCKET_DIR="$XDG_RUNTIME_DIR/xpra"
 declare -A CANVAS_OPEN_REQUESTS=()
 
@@ -1724,9 +2323,9 @@ valid_pid_file() {
   printf '%s\n' "$pid"
 }
 prepare() {
-  mkdir -p "$STATE_DIR" "$APPS_DIR" "$SOCKET_DIR" "$HOME/Downloads" \
+  mkdir -p "$STATE_DIR" "$APPS_DIR" "$PROXY_PID_MAP" "$SOCKET_DIR" "$HOME/Downloads" \
     "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
-  chmod 0700 "$XDG_RUNTIME_DIR" "$SOCKET_DIR" "$APPS_DIR"
+  chmod 0700 "$XDG_RUNTIME_DIR" "$STATE_DIR" "$SOCKET_DIR" "$APPS_DIR" "$PROXY_PID_MAP"
   touch "$ROUTES_FILE"
 }
 resolve_executable() {
@@ -1740,6 +2339,13 @@ resolve_executable() {
     executable="$(readlink -f -- "$executable")"
   fi
   printf '%s\n' "$executable"
+}
+application_kind() {
+  case "${1##*/}" in
+    gimp|gimp-[0-9]*) printf '%s\n' gimp ;;
+    vlc) printf '%s\n' vlc ;;
+    *) printf '%s\n' generic ;;
+  esac
 }
 find_desktop_file() {
   local executable=$1 base=${1##*/} desktop exec_line
@@ -1825,15 +2431,13 @@ ensure_app() {
     printf '%s\n' "$((BACKEND_PORT_BASE + slot))" > "$app_dir/port"
     printf '%s\n' "$((DISPLAY_BASE + slot))" > "$app_dir/display"
     write_app_assets "$executable" "$app_dir"
-    if [[ "$executable" == /usr/bin/gimp ]]; then
-      printf '#!/bin/sh\nexec /usr/local/libexec/cross-gimp "$@"\n' > "$app_dir/open-file"
-    elif [[ "$executable" == /usr/bin/vlc ]]; then
-      printf '#!/bin/sh\nexec /usr/local/libexec/cross-vlc "$@"\n' > "$app_dir/open-file"
-    else
-      printf '#!/bin/sh\nexec %q "$@"\n' "$executable" > "$app_dir/open-file"
-    fi
-    chmod 0700 "$app_dir/open-file"
   fi
+  case "$(application_kind "$executable")" in
+    gimp) printf '#!/bin/sh\nexec /usr/local/libexec/cross-gimp "$@"\n' > "$app_dir/open-file" ;;
+    vlc) printf '#!/bin/sh\nexec /usr/local/libexec/cross-vlc "$@"\n' > "$app_dir/open-file" ;;
+    *) printf '#!/bin/sh\nexec %q "$@"\n' "$executable" > "$app_dir/open-file" ;;
+  esac
+  chmod 0700 "$app_dir/open-file"
   flock -u 9
   printf '%s\n' "$app_dir"
 }
@@ -1860,6 +2464,248 @@ open_canvas_on_chromeos() {
     return 1
   fi
 }
+proxy_pid_start_time() {
+  local stat remainder
+  [[ "$1" =~ ^[0-9]+$ && -r "/proc/$1/stat" ]] || return 1
+  stat="$(<"/proc/$1/stat")"
+  remainder="${stat##*) }"
+  [[ "$remainder" != "$stat" ]] || return 1
+  awk '{print $20}' <<<"$remainder"
+}
+proxy_pid_identity() {
+  local start boot_id
+  start="$(proxy_pid_start_time "$1")" || return 1
+  boot_id="$(</proc/sys/kernel/random/boot_id)"
+  [[ "$boot_id" =~ ^[0-9a-f-]{36}$ ]] || return 1
+  printf '%s:%s\n' "$boot_id" "$start"
+}
+proxy_parent_pid() {
+  awk '/^PPid:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null
+}
+read_proxy_pid_mapping() {
+  local pid=$1 file="$PROXY_PID_MAP/$1" saved_start current_start
+  [[ -r "$file" ]] || return 1
+  IFS= read -r saved_start < "$file" || return 1
+  current_start="$(proxy_pid_identity "$pid" 2>/dev/null || true)"
+  if [[ -z "$current_start" || "$current_start" != "$saved_start" ]]; then
+    rm -f -- "$file"
+    return 1
+  fi
+  mapfile -t PROXY_MAPPING < "$file"
+  (( ${#PROXY_MAPPING[@]} == 4 )) || return 1
+  [[ -x "${PROXY_MAPPING[1]}" ]] || return 1
+}
+write_proxy_pid_mapping() {
+  local pid=$1 start=$2 executable=$3 root_pid=$4 temporary
+  [[ "$pid" =~ ^[0-9]+$ && "$root_pid" =~ ^[0-9]+$ && -n "$start" ]] || return 1
+  temporary="$PROXY_PID_MAP/$pid.new.$$"
+  printf '%s\n%s\n%s\n%s\n' "$start" "$executable" "$root_pid" \
+    "$(proxy_pid_identity "$root_pid" 2>/dev/null || printf '%s' "$start")" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$PROXY_PID_MAP/$pid"
+}
+prune_proxy_pid_mappings() {
+  local file pid
+  local -a mappings=("$PROXY_PID_MAP"/*)
+  (( ${#mappings[@]} >= 512 )) || return 0
+  for file in "${mappings[@]}"; do
+    [[ -f "$file" ]] || continue
+    pid=${file##*/}
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! read_proxy_pid_mapping "$pid"; then
+      rm -f -- "$file"
+    fi
+  done
+}
+classify_proxy_pid() {
+  local peer_pid=$1 pid parent depth exe base start candidate="" candidate_pid="" candidate_start=""
+  declare -g PROXY_ROUTE_EXECUTABLE="" PROXY_ROUTE_ROOT_PID="" \
+    PROXY_ROUTE_START="" PROXY_ROUTE_RECORD=1
+
+  # A plugin or helper inherits the already-established application route of
+  # any living ancestor. Mapping files include the boot ID and /proc start time
+  # so PID reuse, including reuse after reboot, cannot inherit a stale route.
+  pid=$peer_pid
+  for ((depth=0; depth<48 && pid>1; depth++)); do
+    if read_proxy_pid_mapping "$pid"; then
+      PROXY_ROUTE_EXECUTABLE="${PROXY_MAPPING[1]}"
+      PROXY_ROUTE_ROOT_PID="${PROXY_MAPPING[2]}"
+      PROXY_ROUTE_START="${PROXY_MAPPING[3]}"
+      return 0
+    fi
+    parent="$(proxy_parent_pid "$pid")"
+    [[ "$parent" =~ ^[0-9]+$ && "$parent" != "$pid" ]] || break
+    pid=$parent
+  done
+
+  # Otherwise classify the process which opened the X socket.  D-Bus launchers
+  # and toolkit helpers are skipped in favour of their parent application.
+  pid=$peer_pid
+  for ((depth=0; depth<48 && pid>1; depth++)); do
+    exe="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+    start="$(proxy_pid_identity "$pid" 2>/dev/null || true)"
+    base=${exe##*/}
+    case "$base" in
+      dbus-launch|gdbus|dbus-send|pax11publish|at-spi-bus-launcher|at-spi2-registryd|ibus-daemon|bwrap)
+        ;;
+      bash|sh|dash|zsh|fish|xprop|xclip|xsel|xdotool|xwininfo|xlsclients|xrandr|xrdb)
+        candidate="$(resolve_executable /usr/bin/xterm)"
+        candidate_pid=$peer_pid
+        candidate_start="$(proxy_pid_identity "$peer_pid")"
+        PROXY_ROUTE_RECORD=0
+        break
+        ;;
+      '') ;;
+      *)
+        candidate=$exe
+        candidate_pid=$pid
+        candidate_start=$start
+        break
+        ;;
+    esac
+    parent="$(proxy_parent_pid "$pid")"
+    [[ "$parent" =~ ^[0-9]+$ && "$parent" != "$pid" ]] || break
+    pid=$parent
+  done
+  [[ -n "$candidate" && -x "$candidate" && -n "$candidate_start" ]] \
+    || die "cannot identify X11 client pid $peer_pid"
+  PROXY_ROUTE_EXECUTABLE="$(readlink -f -- "$candidate")"
+  PROXY_ROUTE_ROOT_PID=$candidate_pid
+  PROXY_ROUTE_START=$candidate_start
+}
+record_proxy_restore_command() {
+  local app_dir=$1 pid=$2 cwd
+  local -a arguments=()
+  [[ -r "/proc/$pid/cmdline" ]] || return 0
+  mapfile -d '' -t arguments < "/proc/$pid/cmdline" || true
+  (( ${#arguments[@]} > 0 )) || return 0
+  cwd="$(readlink -f -- "/proc/$pid/cwd" 2>/dev/null || true)"
+  [[ -d "$cwd" ]] || cwd=$HOME
+  (cd -- "$cwd" && record_restore_command "$app_dir" "${arguments[@]}")
+}
+publish_app_session_environment() {
+  local app_dir=$1 display pulse_socket cookie_file dbus_address dbus_socket attempt
+  display="$(<"$app_dir/display")"
+  pulse_socket="$XDG_RUNTIME_DIR/xpra/$display/pulse/native"
+  cookie_file="$XDG_CONFIG_HOME/pulse/cookie"
+  for ((attempt=1; attempt<=100; attempt++)); do
+    dbus_address="$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' \
+      "$XDG_RUNTIME_DIR/xpra/$display/dbus.env" 2>/dev/null | head -n 1 || true)"
+    dbus_socket=${dbus_address#unix:path=}
+    dbus_socket=${dbus_socket%%,*}
+    if [[ -S "$pulse_socket" && "$dbus_address" == unix:path=* &&
+          -S "$dbus_socket" &&
+          -s "$cookie_file" ]] &&
+       /usr/bin/xauth list ":$display" 2>/dev/null | grep -q 'MIT-MAGIC-COOKIE-1'; then
+      if env DISPLAY=":$display" XAUTHORITY="$XAUTHORITY" \
+          PULSE_SERVER="unix:$pulse_socket" PULSE_COOKIE="$cookie_file" \
+          /usr/bin/pax11publish -D ":$display" -S "unix:$pulse_socket" \
+          -c "$cookie_file" -e >/dev/null 2>&1 &&
+         /usr/bin/pax11publish -D ":$display" -d 2>/dev/null \
+           | grep -Fq "$pulse_socket"; then
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+route_proxy_pid() {
+  local peer_pid=${1:?missing peer pid} display cookie token app_dir
+  [[ "$peer_pid" =~ ^[0-9]+$ ]] || die "invalid X11 client pid: $peer_pid"
+  [[ -r "/proc/$peer_pid/status" ]] || die "X11 client pid disappeared: $peer_pid"
+  [[ "$(awk '/^Uid:/ {print $2; exit}' "/proc/$peer_pid/status")" == "$(id -u)" ]] \
+    || die "X11 client uid mismatch: $peer_pid"
+  prune_proxy_pid_mappings
+  classify_proxy_pid "$peer_pid"
+  ensure_app_session "$PROXY_ROUTE_EXECUTABLE"
+  app_dir=$APP_DIR
+  publish_app_session_environment "$app_dir" \
+    || die "application session services are not ready for $PROXY_ROUTE_EXECUTABLE"
+  display="$(<"$app_dir/display")"
+  cookie="$(/usr/bin/xauth list ":$display" 2>/dev/null \
+    | awk '$2 == "MIT-MAGIC-COOKIE-1" && $3 ~ /^[0-9a-fA-F]{32}$/ {print tolower($3); exit}')"
+  [[ "$cookie" =~ ^[0-9a-f]{32}$ ]] || die "missing Xauthority cookie for :$display"
+  token="$PROXY_ROUTE_ROOT_PID:$PROXY_ROUTE_START"
+  write_proxy_pid_mapping "$peer_pid" "$(proxy_pid_identity "$peer_pid")" \
+    "$PROXY_ROUTE_EXECUTABLE" "$PROXY_ROUTE_ROOT_PID"
+  write_proxy_pid_mapping "$PROXY_ROUTE_ROOT_PID" "$PROXY_ROUTE_START" \
+    "$PROXY_ROUTE_EXECUTABLE" "$PROXY_ROUTE_ROOT_PID"
+  if (( PROXY_ROUTE_RECORD )); then
+    record_proxy_restore_command "$app_dir" "$PROXY_ROUTE_ROOT_PID"
+  fi
+  printf 'CROSS_X11_ROUTE\t%s\t%s\t%s\t%s\n' \
+    "$display" "$cookie" "$app_dir" "$token"
+}
+notify_proxy_app() {
+  local app_dir=${1:?missing application directory} token=${2:?missing launch token}
+  local hash lock_file previous="" url
+  hash=${app_dir##*/}
+  [[ "$app_dir" == "$APPS_DIR/$hash" && "$hash" =~ ^[0-9a-f]{64}$ &&
+     -r "$app_dir/uuid" &&
+     "$token" =~ ^[0-9]+:[0-9a-f-]{36}:[0-9]+$ ]] \
+    || die 'invalid X11 proxy notification'
+  lock_file="$app_dir/proxy-open.lock"
+  exec 6>"$lock_file"
+  flock 6
+  [[ ! -r "$app_dir/proxy-open.token" ]] || read -r previous < "$app_dir/proxy-open.token"
+  [[ "$previous" != "$token" ]] || return 0
+  url="$(app_url "$app_dir")"
+  if open_canvas_on_chromeos "$url"; then
+    printf '%s\n' "$token" > "$app_dir/proxy-open.token"
+  fi
+}
+proxy_socket_listening() {
+  awk -v path="$PROXY_SOCKET" '$6 == "01" && $8 == path {found=1} END {exit !found}' \
+    /proc/net/unix
+}
+start_x11_proxy() {
+  local pid cookie attempt
+  prepare
+  if pid="$(valid_pid_file "$PROXY_PID_FILE" cross-x11-proxy 2>/dev/null)"; then
+    [[ -S "$PROXY_SOCKET" ]] && proxy_socket_listening \
+      || die "X11 proxy pid $pid has no listening display socket"
+    return
+  fi
+  rm -f "$PROXY_PID_FILE"
+  if [[ -S "$PROXY_SOCKET" ]]; then
+    proxy_socket_listening && die "display :$PROXY_DISPLAY is already owned by another X server"
+    rm -f -- "$PROXY_SOCKET"
+  fi
+  if [[ -r "$PROXY_COOKIE_FILE" ]]; then cookie="$(tr -d '\r\n' < "$PROXY_COOKIE_FILE")"; else cookie=""; fi
+  if [[ ! "$cookie" =~ ^[0-9a-f]{32}$ ]]; then
+    cookie="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+    [[ "$cookie" =~ ^[0-9a-f]{32}$ ]] || die 'could not generate X11 proxy cookie'
+    printf '%s\n' "$cookie" > "$PROXY_COOKIE_FILE"
+  fi
+  chmod 0600 "$PROXY_COOKIE_FILE"
+  /usr/bin/xauth add ":$PROXY_DISPLAY" MIT-MAGIC-COOKIE-1 "$cookie"
+  chmod 0600 "$XAUTHORITY"
+  nohup /usr/local/libexec/cross-x11-proxy "$PROXY_DISPLAY" \
+    "$PROXY_COOKIE_FILE" /usr/local/libexec/cross-desktop \
+    </dev/null >>"$PROXY_LOG" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$PROXY_PID_FILE"
+  for ((attempt=1; attempt<=100; attempt++)); do
+    if pid_running "$pid" && [[ -S "$PROXY_SOCKET" ]] && proxy_socket_listening; then return; fi
+    sleep 0.1
+  done
+  tail -n 80 "$PROXY_LOG" >&2 || true
+  die "X11 multiplexer did not become ready on display :$PROXY_DISPLAY"
+}
+stop_x11_proxy() {
+  local pid attempt
+  pid="$(valid_pid_file "$PROXY_PID_FILE" cross-x11-proxy 2>/dev/null || true)"
+  if [[ -n "$pid" ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((attempt=1; attempt<=50; attempt++)); do
+      pid_running "$pid" || break
+      sleep 0.1
+    done
+    pid_running "$pid" && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PROXY_PID_FILE" "$PROXY_SOCKET"
+  /usr/bin/xauth remove ":$PROXY_DISPLAY" >/dev/null 2>&1 || true
+}
 start_router() {
   local pid attempt
   prepare
@@ -1883,7 +2729,19 @@ start_router() {
 start_app_session() {
   local app_dir=$1 pid port display name attempt
   SESSION_STARTED=0
-  if pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null)"; then return; fi
+  if pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null)"; then
+    if publish_app_session_environment "$app_dir"; then return; fi
+    printf 'cross desktop: WARN: restarting incomplete application session %s\n' \
+      "$(<"$app_dir/name")" >&2
+    display="$(<"$app_dir/display")"
+    /usr/bin/xpra stop ":$display" --socket-dir="$SOCKET_DIR" >/dev/null 2>&1 \
+      || kill -TERM "$pid" 2>/dev/null || true
+    for ((attempt=1; attempt<=50; attempt++)); do
+      pid_running "$pid" || break
+      sleep 0.1
+    done
+    pid_running "$pid" && kill -KILL "$pid" 2>/dev/null || true
+  fi
   rm -f "$app_dir/xpra.pid"
   port="$(<"$app_dir/port")"
   display="$(<"$app_dir/display")"
@@ -1929,8 +2787,11 @@ start_app_session() {
   for ((attempt=1; attempt<=300; attempt++)); do
     if pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null)" &&
        curl --silent --fail --max-time 1 "http://127.0.0.1:$port/" >/dev/null; then
-      SESSION_STARTED=1
-      return
+      if publish_app_session_environment "$app_dir"; then
+        SESSION_STARTED=1
+        return
+      fi
+      break
     fi
     sleep 0.1
   done
@@ -1955,15 +2816,19 @@ publish_routes() {
 }
 ensure_app_session() {
   local executable=$1
+  prepare
+  exec 7>"$STATE_DIR/session.lock"
+  flock 7
   APP_DIR="$(ensure_app "$executable")"
   start_router
   start_app_session "$APP_DIR"
   publish_routes
+  flock -u 7
 }
 record_restore_command() {
   local app_dir=$1; shift
   local temporary argument
-  temporary="$app_dir/restore-app.new"
+  temporary="$app_dir/restore-app.new.$$"
   {
     printf '#!/bin/bash\ncd %q 2>/dev/null || cd -- "$HOME"\nexec' "$PWD"
     for argument in "$@"; do printf ' %q' "$argument"; done
@@ -1995,13 +2860,14 @@ launch_for_app() {
   printf '%s\n' "$url"
 }
 run_app() {
-  local executable
+  local executable kind
   (( $# > 0 )) || die 'no application command supplied'
   executable="$(resolve_executable "$1")"
-  if [[ "$executable" == /usr/bin/gimp ]]; then
+  kind="$(application_kind "$executable")"
+  if [[ "$kind" == gimp ]]; then
     shift
     launch_for_app "$executable" /usr/local/libexec/cross-gimp "$@"
-  elif [[ "$executable" == /usr/bin/vlc ]]; then
+  elif [[ "$kind" == vlc ]]; then
     shift
     launch_for_app "$executable" /usr/local/libexec/cross-vlc "$@"
   else
@@ -2032,12 +2898,14 @@ start_server() {
   done
   (( found > 0 )) || die 'failed to initialize the default application session'
   publish_routes
+  start_x11_proxy
   printf 'Cross application router is running on 127.0.0.1:%s.\n' "$ROUTER_PORT"
   app_url "$default_dir"
 }
 stop_server() {
   local app_dir pid display router_pid="" attempt
   prepare
+  stop_x11_proxy
   for app_dir in "$APPS_DIR"/*; do
     [[ -d "$app_dir" ]] || continue
     pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null || true)"
@@ -2065,10 +2933,17 @@ stop_server() {
   echo 'Cross application sessions stopped.'
 }
 show_status() {
-  local router_pid app_dir pid running=0
+  local router_pid proxy_pid app_dir pid running=0 degraded=0
   router_pid="$(valid_pid_file "$ROUTER_PID_FILE" cross-desktop-router 2>/dev/null || true)"
   [[ -n "$router_pid" ]] || { echo 'Cross Desktop is stopped.'; return 3; }
   printf 'Cross application router is running (pid %s, 127.0.0.1:%s).\n' "$router_pid" "$ROUTER_PORT"
+  proxy_pid="$(valid_pid_file "$PROXY_PID_FILE" cross-x11-proxy 2>/dev/null || true)"
+  if [[ -n "$proxy_pid" && -S "$PROXY_SOCKET" ]] && proxy_socket_listening; then
+    printf 'X11 multiplexer is running (pid %s, display :%s).\n' "$proxy_pid" "$PROXY_DISPLAY"
+  else
+    printf 'X11 multiplexer is stopped.\n'
+    degraded=1
+  fi
   for app_dir in "$APPS_DIR"/*; do
     [[ -d "$app_dir" ]] || continue
     pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null || true)"
@@ -2077,10 +2952,12 @@ show_status() {
     ((running += 1))
   done
   printf '%s application session(s) running.\n' "$running"
+  (( degraded == 0 ))
 }
 show_logs() {
   local lines=${1:-80} app_dir
   [[ ! -r "$ROUTER_LOG" ]] || { echo '== router =='; tail -n "$lines" "$ROUTER_LOG"; }
+  [[ ! -r "$PROXY_LOG" ]] || { echo '== X11 multiplexer =='; tail -n "$lines" "$PROXY_LOG"; }
   for app_dir in "$APPS_DIR"/*; do
     [[ -r "$app_dir/xpra.log" ]] || continue
     printf '== %s ==\n' "$(<"$app_dir/name")"
@@ -2098,6 +2975,8 @@ case "${1:-start}" in
     app_url "$app_dir"
     ;;
   log) show_logs "${2:-80}" ;;
+  route-pid) shift; route_proxy_pid "${1:-}" ;;
+  proxy-notify) shift; notify_proxy_app "${1:-}" "${2:-}" ;;
   run) shift; run_app "$@" ;;
   open) shift; open_targets "$@" ;;
   vlc) shift; run_app /usr/bin/vlc "$@" ;;
@@ -2108,9 +2987,12 @@ DESKTOP
   sudo sed -i \
     -e "s/__CROSS_DESKTOP_PORT__/$CROSS_DESKTOP_PORT/g" \
     -e "s/__CROSS_DESKTOP_UUID__/$CROSS_DESKTOP_UUID/g" \
+    -e "s/__CROSS_X11_PROXY_DISPLAY__/$CROSS_X11_PROXY_DISPLAY/g" \
     -e "s|__CROSS_HOST_HOME__|$quoted_host_home|g" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop"
   sudo chown root:root "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
+    "$CROSS_ROOT/usr/local/libexec/cross-x11-proxy" \
+    "$CROSS_ROOT/usr/local/src/cross/cross-x11-proxy.c" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
     "$CROSS_ROOT/usr/local/libexec/cross-gimp" \
     "$CROSS_ROOT/usr/local/libexec/cross-vlc" \
@@ -2118,12 +3000,14 @@ DESKTOP
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
   sudo chmod 0755 "$CROSS_ROOT/usr/local/libexec/cross-desktop" \
+    "$CROSS_ROOT/usr/local/libexec/cross-x11-proxy" \
     "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" \
     "$CROSS_ROOT/usr/local/libexec/cross-gimp" \
     "$CROSS_ROOT/usr/local/libexec/cross-vlc" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-file" \
     "$CROSS_ROOT/usr/local/libexec/cross-open-target" \
     "$CROSS_ROOT/usr/local/libexec/cross-run-app"
+  sudo chmod 0644 "$CROSS_ROOT/usr/local/src/cross/cross-x11-proxy.c"
   sudo ln -sfn /usr/local/libexec/cross-desktop \
     "$CROSS_ROOT/usr/local/bin/cross_desktop"
 }
@@ -2184,6 +3068,15 @@ export PATH="\$HOME/.local/bin:\$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sb
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
 export CROSS_SESSION=1
+export DISPLAY=:$CROSS_X11_PROXY_DISPLAY
+export XAUTHORITY="\$HOME/.Xauthority"
+export XDG_RUNTIME_DIR=/run/user/$uid
+export DBUS_SESSION_BUS_ADDRESS=autolaunch:
+export QT_QPA_PLATFORM=xcb
+export GDK_BACKEND=x11
+export SDL_VIDEODRIVER=x11
+export QT_X11_NO_MITSHM=1
+export LIBGL_ALWAYS_SOFTWARE=1
 export LANG=C.UTF-8
 export LC_ALL=
 : "\${TERM:=dumb}"
@@ -2363,6 +3256,7 @@ SSHCFG
     printf 'HOST_SSH_BIN=%q\n' "$HOST_SSH_BIN"
     printf 'CROSS_SSH_PORT=%q\n' "$CROSS_SSH_PORT"
     printf 'CROSS_DESKTOP_PORT=%q\n' "$CROSS_DESKTOP_PORT"
+    printf 'CROSS_X11_PROXY_DISPLAY=%q\n' "$CROSS_X11_PROXY_DISPLAY"
     printf 'CROSS_DESKTOP_UUID=%q\n' "$CROSS_DESKTOP_UUID"
     printf 'CROSS_DESKTOP_URL=%q\n' \
       "http://cross-${CROSS_DESKTOP_UUID}.localhost:${CROSS_DESKTOP_PORT}"
@@ -3469,7 +4363,12 @@ validate() {
     test "$(command -v xdg-open)" = /usr/local/bin/xdg-open
     test -S /run/dbus/system_bus_socket
   '
-  "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
+  "$CROSS_BIN/cross" /bin/sh -c '
+    test "$CROSS_SESSION" = 1
+    test "$DISPLAY" = :'"$CROSS_X11_PROXY_DISPLAY"'
+    test "$XAUTHORITY" = "$HOME/.Xauthority"
+    test "$DBUS_SESSION_BUS_ADDRESS" = autolaunch:
+  '
   "$CROSS_BIN/cross" /bin/sh -c '
     case "$(uname -m)" in
       x86_64)
@@ -3526,9 +4425,15 @@ C_SOURCE
     test -x /usr/bin/ristretto
     test -x /usr/bin/mupdf-x11
     test -x /usr/local/libexec/cross-desktop-router
+    test -x /usr/local/libexec/cross-x11-proxy
     test -x /usr/local/libexec/cross-vlc
     test -x /usr/local/libexec/cross-open-target
     test "$(stat -c %u:%a /tmp/.X11-unix)" = 0:1777
+    test -S /tmp/.X11-unix/X'"$CROSS_X11_PROXY_DISPLAY"'
+    awk -v path=/tmp/.X11-unix/X'"$CROSS_X11_PROXY_DISPLAY"' \
+      '\''$6 == "01" && $8 == path {found=1} END {exit !found}'\'' /proc/net/unix
+    xauth list :'"$CROSS_X11_PROXY_DISPLAY"' | grep -q "MIT-MAGIC-COOKIE-1"
+    ! grep -q "__CROSS_" /usr/local/libexec/cross-desktop
     grep -Rq "def map_all_keynames(self)" \
       /usr/lib/python*/site-packages/xpra/x11/server/keyboard_config.py
     test -f /usr/local/share/cross-desktop/www/manifest.webmanifest
@@ -3621,7 +4526,9 @@ Cross Desktop:
 
   Each application keeps a stable UUID, a dedicated X11-to-canvas session and
   an application-branded PWA. Sessions support browser audio, clipboard
-  synchronization and file drag-and-drop. Start applications directly:
+  synchronization and file drag-and-drop. Ordinary GUI commands launched in a
+  Cross shell are detected by the X11 multiplexer and open their own tab; no
+  cross_desktop prefix is required. Start applications directly:
     vlc
     vlc ~/Downloads/movie.mp4
 

@@ -1,8 +1,9 @@
 #!/bin/bash
-# cross.sh - Alpine-packages-only development environment for ChromeOS Developer Mode.
+# cross.sh - Alpine-based development environment for ChromeOS Developer Mode.
 #
 # No third-party source builds, containers, VMs, or mount namespaces. Alpine executes in a
-# chroot and is reached over a VT-2-started, localhost-only OpenSSH service.
+# chroot and is reached over a VT-2-started, localhost-only OpenSSH service. A pinned Debian
+# glibc runtime coexists with musl so prebuilt glibc-linked programs can run.
 # The ChromeOS HOME is bind-mounted at the same path. The *bind mount only* is
 # remounted with exec, so HOME-resident ELF programs (e.g. cargo run output or
 # VS Code CLI helpers) can execute without tool-specific cache/target overrides.
@@ -19,10 +20,12 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-18.60-no-software-keyboard"
+SCRIPT_VERSION="2026-11-20.61-glibc-2.44"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
+GLIBC_VERSION="2.44"
+GLIBC_DEBIAN_VERSION="2.44-3"
 INITIAL_DOWNLOAD_JOBS=6
 CROSS_PREFIX="${CROSS_PREFIX:-/usr/local/cross}"
 CROSS_ROOT="$CROSS_PREFIX/alpine"
@@ -738,7 +741,7 @@ install_alpine_packages() {
     build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
-    rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec gcompat
+    rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec
     xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good xkeyboard-config
     pulseaudio pulseaudio-utils dbus dbus-x11 xdg-utils shared-mime-info
     vlc vlc-qt gimp xterm pcmanfm gvfs mousepad ristretto mupdf-x11 font-dejavu
@@ -812,25 +815,93 @@ path.write_text(source, encoding="utf-8")
 PYTHON_XPRA_KEYBOARD
 }
 
-# npm's prebuilt workerd binaries use the glibc ELF interpreter. Alpine's
-# gcompat supplies that interpreter, but gcompat 1.1.0-r4 lacks __res_init,
-# which current workerd binaries reference. Supply only that missing alias;
-# this remains dynamically linked to Alpine musl and avoids vendoring glibc.
-configure_glibc_compat() {
-  local shim="/usr/local/lib/cross-gcompat-resolver.so"
-  info "Configuring glibc compatibility for prebuilt workerd"
-  sudo mkdir -p "$CROSS_ROOT/usr/local/lib"
-  printf '%s\n' \
-    '#include <resolv.h>' \
-    'int __res_init(void) { return res_init(); }' \
-    | sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/cc \
-        -shared -fPIC -O2 -Wl,-soname,cross-gcompat-resolver.so \
-        -x c - -o "$shim"
-  sudo chown root:root "$CROSS_ROOT$shim"
-  sudo chmod 0755 "$CROSS_ROOT$shim"
-  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/nm -D "$shim" \
-    | grep -Eq '[[:space:]]__res_init$' \
-    || die "workerd compatibility shim does not export __res_init"
+# Install the current stable GNU libc alongside Alpine's musl. Debian's
+# multiarch library directory does not overlap Alpine's native /usr/lib, so
+# musl remains the system libc while glibc-linked binaries get a real loader.
+# Snapshot content hashes make these package URLs immutable; SHA-256 is checked
+# separately before anything is extracted into the rootfs.
+install_glibc_runtime() {
+  local deb_arch multiarch loader runtime_snapshot gconv_snapshot
+  local runtime_sha256 gconv_sha256 runtime_deb gconv_deb package_dir actual
+  local glibc_report
+
+  case "$ALPINE_ARCH" in
+    x86_64)
+      deb_arch="amd64"
+      multiarch="x86_64-linux-gnu"
+      loader="/lib64/ld-linux-x86-64.so.2"
+      runtime_snapshot="2c508bb2cae4021afb0363c215ccfc0a5ade6370"
+      gconv_snapshot="0225437d461e2a9b522aaca33e16bfc4acf6dd09"
+      runtime_sha256="09ceffb81fdc6fd33c01e672889f7a6c41671feb52b9cf34c33879228dcd9cc2"
+      gconv_sha256="7444dc8b630cf14de1d23db40ad3b6c586e71b6746f999e86bd003a050fbed62"
+      ;;
+    aarch64)
+      deb_arch="arm64"
+      multiarch="aarch64-linux-gnu"
+      loader="/lib/ld-linux-aarch64.so.1"
+      runtime_snapshot="8399b67d50acdafd39091a23923447b90411241a"
+      gconv_snapshot="0a1190638c0a8b3a1ada93aceddd8ab92cc7b124"
+      runtime_sha256="cec5926afafdce6d1cbd926790c283673e6541b5007fdac0d6760ecc41276da7"
+      gconv_sha256="a6c9350e94b8585f86fc9d9d744d684579dc52cd7f9d1ce2bba7e0673352f299"
+      ;;
+    *) die "glibc runtime is unavailable for Alpine architecture: $ALPINE_ARCH" ;;
+  esac
+
+  info "Installing GNU libc ${GLIBC_VERSION} runtime for ${deb_arch}"
+  runtime_deb="$CROSS_CACHE/libc6_${GLIBC_DEBIAN_VERSION}_${deb_arch}.deb"
+  gconv_deb="$CROSS_CACHE/libc-gconv-modules-extra_${GLIBC_DEBIAN_VERSION}_${deb_arch}.deb"
+  fetch "https://snapshot.debian.org/file/${runtime_snapshot}" "$runtime_deb"
+  fetch "https://snapshot.debian.org/file/${gconv_snapshot}" "$gconv_deb"
+
+  actual="$(sha256_file "$runtime_deb")"
+  if [[ "${actual,,}" != "$runtime_sha256" ]]; then
+    rm -f "$runtime_deb"
+    die "SHA-256 mismatch for Debian libc6 ${GLIBC_DEBIAN_VERSION} (${deb_arch})"
+  fi
+  actual="$(sha256_file "$gconv_deb")"
+  if [[ "${actual,,}" != "$gconv_sha256" ]]; then
+    rm -f "$gconv_deb"
+    die "SHA-256 mismatch for Debian libc-gconv-modules-extra ${GLIBC_DEBIAN_VERSION} (${deb_arch})"
+  fi
+
+  # Remove the former emulation layer before replacing its ELF-loader path.
+  if apk_chroot info --exists gcompat >/dev/null 2>&1; then
+    apk_chroot del gcompat
+  fi
+  sudo rm -f "$CROSS_ROOT/usr/local/lib/cross-gcompat-resolver.so"
+
+  package_dir="$CROSS_ROOT/tmp/cross-glibc-packages"
+  sudo rm -rf "$package_dir"
+  sudo mkdir -p "$package_dir"
+  sudo cp -f "$runtime_deb" "$package_dir/libc6.deb"
+  sudo cp -f "$gconv_deb" "$package_dir/gconv.deb"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/bash -c '
+    set -Eeuo pipefail
+    multiarch="$1"
+    for package in /tmp/cross-glibc-packages/libc6.deb \
+                   /tmp/cross-glibc-packages/gconv.deb; do
+      /usr/bin/ar p "$package" data.tar.xz \
+        | /usr/bin/tar -xJf - -C / \
+            "./usr/lib/$multiarch" "./usr/share/doc"
+    done
+  ' cross-glibc-install "$multiarch"
+  sudo rm -rf "$package_dir"
+
+  sudo mkdir -p "$(dirname "$CROSS_ROOT$loader")"
+  sudo ln -sfn "/usr/lib/${multiarch}/${loader##*/}" "$CROSS_ROOT$loader"
+  printf '%s\n' "$GLIBC_DEBIAN_VERSION" \
+    | sudo tee "$CROSS_ROOT/usr/lib/$multiarch/.cross-glibc-version" >/dev/null
+  sudo chown root:root "$CROSS_ROOT/usr/lib/$multiarch/.cross-glibc-version"
+  sudo chmod 0644 "$CROSS_ROOT/usr/lib/$multiarch/.cross-glibc-version"
+
+  glibc_report="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" "$loader" \
+    --library-path "/usr/lib/$multiarch" "/usr/lib/$multiarch/libc.so.6")"
+  [[ "$glibc_report" == *"stable release version $GLIBC_VERSION"* ]] \
+    || die "GNU libc ${GLIBC_VERSION} runtime validation failed"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/nm -D \
+    "/usr/lib/$multiarch/libc.so.6" \
+    | grep -E '[[:space:]]__res_init@@GLIBC_' >/dev/null \
+    || die "GNU libc ${GLIBC_VERSION} does not export __res_init"
 }
 
 configure_chronos_user() {
@@ -1990,9 +2061,6 @@ export CROSS_WORK=$(printf '%q' "$CROSS_WORK/chronos")
 export PATH="\$HOME/.local/bin:\$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
-# gcompat provides the glibc loader used by npm's workerd binary. This tiny
-# musl DSO supplies __res_init, which Alpine gcompat 1.1.0-r4 does not export.
-export LD_PRELOAD=/usr/local/lib/cross-gcompat-resolver.so
 export CROSS_SESSION=1
 export LANG=C.UTF-8
 export LC_ALL=
@@ -3283,11 +3351,23 @@ validate() {
   '
   "$CROSS_BIN/cross" /bin/sh -c 'test "$CROSS_SESSION" = 1'
   "$CROSS_BIN/cross" /bin/sh -c '
-    test -r /usr/local/lib/cross-gcompat-resolver.so
-    test -e /lib64/ld-linux-x86-64.so.2 -o \
-         -e /lib/ld-linux-aarch64.so.1 -o \
-         -e /lib64/ld-linux-aarch64.so.1
-    test "$LD_PRELOAD" = /usr/local/lib/cross-gcompat-resolver.so
+    case "$(uname -m)" in
+      x86_64)
+        multiarch=x86_64-linux-gnu
+        loader=/lib64/ld-linux-x86-64.so.2
+        ;;
+      aarch64)
+        multiarch=aarch64-linux-gnu
+        loader=/lib/ld-linux-aarch64.so.1
+        ;;
+      *) exit 1 ;;
+    esac
+    test "$(cat "/usr/lib/$multiarch/.cross-glibc-version")" = '"$GLIBC_DEBIAN_VERSION"'
+    test -e "$loader"
+    "$loader" --library-path "/usr/lib/$multiarch" \
+      "/usr/lib/$multiarch/libc.so.6" \
+      | grep -Fq "stable release version '"$GLIBC_VERSION"'"
+    test -z "${LD_PRELOAD:-}"
   '
   "$CROSS_BIN/cross" /bin/sh -c 'test "$(command -v npx)" = /usr/bin/npx'
   [[ "$("$CROSS_BIN/cross" sudo -n /usr/bin/id -u)" == 0 ]] \
@@ -3374,7 +3454,7 @@ main() {
   configure_rootfs
   install_alpine_packages
   configure_xpra_keyboard_compat
-  configure_glibc_compat
+  install_glibc_runtime
   configure_chronos_user
   configure_cross_sudo
   configure_cross_desktop
@@ -3402,9 +3482,10 @@ main() {
   info "Setup complete"
   cat <<SUMMARY
 
-No third-party source packages were built; system tools and libraries came from
-Alpine ${ALPINE_BRANCH} repositories. A two-line musl compatibility DSO is built
-locally so npm's glibc-linked workerd binary can run with Alpine gcompat.
+No third-party source packages were built. System tools and musl libraries came
+from Alpine ${ALPINE_BRANCH}; checksum-pinned Debian ${GLIBC_DEBIAN_VERSION}
+runtime packages provide GNU libc ${GLIBC_VERSION} alongside musl for
+glibc-linked binaries such as npm's workerd.
 Transactions use Alpine apk-tools v2 static from ${APK_COMPAT_BRANCH} because
 the current ChromeOS kernel rejects apk v3 memfd hooks.
 

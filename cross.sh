@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-20.65-x11-multiplexer"
+SCRIPT_VERSION="2026-11-20.66-private-pulseaudio"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -2595,7 +2595,9 @@ publish_app_session_environment() {
     if [[ -S "$pulse_socket" && "$dbus_address" == unix:path=* &&
           -S "$dbus_socket" &&
           -s "$cookie_file" ]] &&
-       /usr/bin/xauth list ":$display" 2>/dev/null | grep -q 'MIT-MAGIC-COOKIE-1'; then
+       /usr/bin/xauth list ":$display" 2>/dev/null | grep -q 'MIT-MAGIC-COOKIE-1' &&
+       env PULSE_SERVER="unix:$pulse_socket" PULSE_COOKIE="$cookie_file" \
+         /usr/bin/timeout 1 /usr/bin/pactl info >/dev/null 2>&1; then
       if env DISPLAY=":$display" XAUTHORITY="$XAUTHORITY" \
           PULSE_SERVER="unix:$pulse_socket" PULSE_COOKIE="$cookie_file" \
           /usr/bin/pax11publish -D ":$display" -S "unix:$pulse_socket" \
@@ -2746,7 +2748,12 @@ start_app_session() {
   port="$(<"$app_dir/port")"
   display="$(<"$app_dir/display")"
   name="$(<"$app_dir/name")"
-  /usr/bin/xpra start ":$display" \
+  # Xpra 6.4.3 creates a per-display native socket but, when HOME is writable,
+  # omits PulseAudio's per-display runtime setting. Concurrent sessions then
+  # contend for one /tmp/pulse-*/autospawn.lock and all but one fail to create
+  # their socket. Pin the Pulse runtime to the same private directory explicitly.
+  PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/xpra/$display/pulse" \
+    /usr/bin/xpra start ":$display" \
     --daemon=yes \
     --bind-tcp="127.0.0.1:$port" \
     --html=/usr/local/share/cross-desktop/www \

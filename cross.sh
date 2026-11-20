@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-20.61-glibc-2.44"
+SCRIPT_VERSION="2026-11-20.62-glibc-tar-path"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -878,10 +878,12 @@ install_glibc_runtime() {
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /bin/bash -c '
     set -Eeuo pipefail
     multiarch="$1"
+    ar_bin="$(command -v ar)"
+    tar_bin="$(command -v tar)"
     for package in /tmp/cross-glibc-packages/libc6.deb \
                    /tmp/cross-glibc-packages/gconv.deb; do
-      /usr/bin/ar p "$package" data.tar.xz \
-        | /usr/bin/tar -xJf - -C / \
+      "$ar_bin" p "$package" data.tar.xz \
+        | "$tar_bin" -xJf - -C / \
             "./usr/lib/$multiarch" "./usr/share/doc"
     done
   ' cross-glibc-install "$multiarch"

@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-20.63-latest-glibc"
+SCRIPT_VERSION="2026-11-20.64-xpra-startup"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -742,7 +742,7 @@ install_alpine_packages() {
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec
-    xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good xkeyboard-config
+    xpra xpra-webclient py3-gst gstreamer gst-plugins-base gst-plugins-good xkeyboard-config xauth
     pulseaudio pulseaudio-utils dbus dbus-x11 xdg-utils shared-mime-info
     vlc vlc-qt gimp xterm pcmanfm gvfs mousepad ristretto mupdf-x11 font-dejavu
   )
@@ -1081,6 +1081,11 @@ configure_cross_desktop() {
     || die "xpra-webclient did not install its HTML5 client"
   sudo rm -rf "$CROSS_ROOT/usr/local/share/cross-desktop"
   sudo mkdir -p "$www" "$CROSS_ROOT/usr/local/bin" "$CROSS_ROOT/usr/local/libexec"
+  # Xorg expects this shared socket directory to be owned by root. When Xpra
+  # has to create it as chronos, Xorg warns and Xauthority setup is unreliable.
+  sudo mkdir -p "$CROSS_ROOT/tmp/.X11-unix"
+  sudo chown root:root "$CROSS_ROOT/tmp/.X11-unix"
+  sudo chmod 1777 "$CROSS_ROOT/tmp/.X11-unix"
   sudo cp -a "$CROSS_ROOT/usr/share/xpra/www/." "$www/"
   # The package ships pre-compressed copies. They must not shadow the branded
   # index and PWA files below.
@@ -1888,12 +1893,15 @@ start_app_session() {
     --bind-tcp="127.0.0.1:$port" \
     --html=/usr/local/share/cross-desktop/www \
     --socket-dir="$SOCKET_DIR" \
+    --socket-dirs="$SOCKET_DIR" \
     --pidfile="$app_dir/xpra.pid" \
     --log-dir="$app_dir" \
     --log-file=xpra.log \
     --session-name="$name" \
     --mdns=no \
     --systemd-run=no \
+    --ssh-upgrade=no \
+    --opengl=no \
     --dbus=yes \
     --clipboard=yes \
     --file-transfer=yes \
@@ -1915,7 +1923,10 @@ start_app_session() {
     --exit-with-children=no \
     --terminate-children=yes \
     --notifications=yes
-  for ((attempt=1; attempt<=80; attempt++)); do
+  # Xpra deliberately probes unknown sockets for six seconds after an unclean
+  # shutdown before replacing them. Leave enough time for that recovery plus
+  # Xorg, D-Bus and PulseAudio initialization on slower ChromeOS hardware.
+  for ((attempt=1; attempt<=300; attempt++)); do
     if pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null)" &&
        curl --silent --fail --max-time 1 "http://127.0.0.1:$port/" >/dev/null; then
       SESSION_STARTED=1
@@ -2296,7 +2307,6 @@ AuthorizedKeysFile /etc/ssh/cross_authorized_keys
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
-UsePAM no
 StrictModes yes
 ForceCommand /usr/local/libexec/cross-session
 DisableForwarding yes
@@ -2307,7 +2317,6 @@ GatewayPorts no
 PermitTTY yes
 UseDNS no
 PrintMotd no
-PrintLastLog no
 LoginGraceTime 15
 MaxAuthTries 3
 MaxSessions 16
@@ -3454,7 +3463,7 @@ validate() {
   "$CROSS_BIN/cross" status
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra dbus-launch dbus-send vlc gimp xterm xdg-open; do
+    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xpra xauth dbus-launch dbus-send vlc gimp xterm xdg-open; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
     test "$(command -v xdg-open)" = /usr/local/bin/xdg-open
@@ -3519,6 +3528,7 @@ C_SOURCE
     test -x /usr/local/libexec/cross-desktop-router
     test -x /usr/local/libexec/cross-vlc
     test -x /usr/local/libexec/cross-open-target
+    test "$(stat -c %u:%a /tmp/.X11-unix)" = 0:1777
     grep -Rq "def map_all_keynames(self)" \
       /usr/lib/python*/site-packages/xpra/x11/server/keyboard_config.py
     test -f /usr/local/share/cross-desktop/www/manifest.webmanifest
@@ -3536,6 +3546,9 @@ C_SOURCE
     grep -Fq "virtualkeyboardpolicy" \
       /usr/local/share/cross-desktop/www/cross-app.js
     grep -Fq -- "--audio-source=pulse" /usr/local/libexec/cross-desktop
+    grep -Fq -- "--socket-dirs=\"\$SOCKET_DIR\"" /usr/local/libexec/cross-desktop
+    grep -Fq -- "--ssh-upgrade=no" /usr/local/libexec/cross-desktop
+    grep -Fq -- "--opengl=no" /usr/local/libexec/cross-desktop
     grep -Fq -- "--aout=pulse" /usr/local/libexec/cross-vlc
     for plugin in pulsesrc opusenc matroskamux; do
       gst-inspect-1.0 "$plugin" >/dev/null

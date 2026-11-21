@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-21.68-multi-output-webaudio"
+SCRIPT_VERSION="2026-11-21.69-atomic-webaudio-routing"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1386,11 +1386,11 @@ APP_CSS
       throw error;
     }
   };
-  const rebuildOutputRoutes = async () => {
-    const stream = audioRouting.streamDestination?.stream;
-    if (!stream || !AudioContextClass) return;
+  const buildOutputRoutes = async (stream) => {
+    if (!stream || !AudioContextClass) return [];
     try {
       const targets = await outputTargets();
+      if (targets.length !== 2) return [];
       const routes = [];
       for (const target of targets) {
         try {
@@ -1399,13 +1399,23 @@ APP_CSS
           console.warn(`Cross audio output route failed for ${target.label}:`, error);
         }
       }
-      const previous = audioRouting.outputs;
-      audioRouting.outputs = routes;
-      connectInput();
-      closeOutputRoutes(previous);
+      if (routes.length !== targets.length) {
+        closeOutputRoutes(routes);
+        return [];
+      }
+      return routes;
     } catch (error) {
       console.warn("Cross audio output enumeration failed:", error);
+      return [];
     }
+  };
+  const rebuildOutputRoutes = async () => {
+    const stream = audioRouting.streamDestination?.stream;
+    const routes = await buildOutputRoutes(stream);
+    if (!routes.length) return;
+    const previous = audioRouting.outputs;
+    audioRouting.outputs = routes;
+    closeOutputRoutes(previous);
   };
   const ensureAudioRouting = async (xpra, refreshDevices = false) => {
     if (!AudioContextClass) return;
@@ -1419,16 +1429,38 @@ APP_CSS
       const candidate = audioInput(xpra);
       if (!candidate) return;
       if (audioRouting.token !== candidate.token) {
-        clearInputRoute();
         const streamDestination = candidate.context.createMediaStreamDestination();
+        const routes = await buildOutputRoutes(streamDestination.stream);
+        if (!routes.length) {
+          for (const track of streamDestination.stream.getTracks()) track.stop();
+          return;
+        }
         let input = candidate.input;
-        if (!input) input = candidate.context.createMediaElementSource(candidate.element);
+        try {
+          if (!input) input = candidate.context.createMediaElementSource(candidate.element);
+        } catch (error) {
+          closeOutputRoutes(routes);
+          for (const track of streamDestination.stream.getTracks()) track.stop();
+          throw error;
+        }
+        try {
+          input.disconnect();
+          input.connect(streamDestination);
+        } catch (error) {
+          try {
+            input.connect(candidate.context.destination);
+          } catch {}
+          closeOutputRoutes(routes);
+          for (const track of streamDestination.stream.getTracks()) track.stop();
+          throw error;
+        }
+        clearInputRoute();
         audioRouting.token = candidate.token;
         audioRouting.context = candidate.context;
         audioRouting.input = input;
         audioRouting.streamDestination = streamDestination;
-        connectInput();
-        audioRouting.devicesDirty = true;
+        audioRouting.outputs = routes;
+        audioRouting.devicesDirty = false;
       }
       if (audioRouting.devicesDirty || !audioRouting.outputs.length) {
         audioRouting.devicesDirty = false;

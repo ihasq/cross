@@ -251,7 +251,9 @@ vlc ~/Downloads/movie.mp4
 
 The browser client feeds the received Xpra stream into Web Audio and keeps
 separate output contexts for the local ChromeOS speaker and headphones. Each
-context is bound directly to its device with `AudioContext.setSinkId()`.
+context is bound directly to its device with `AudioContext.setSinkId()`. Cross
+switches from Xpra's existing playback path only after both output contexts are
+connected, so transient device enumeration cannot leave the tab silent.
 
 Run GIMP 3 in its own application-branded PWA. GIMP uses its default
 single-window interface and Cross suppresses the startup splash and first-run

@@ -249,6 +249,10 @@ vlc
 vlc ~/Downloads/movie.mp4
 ```
 
+The browser client feeds the received Xpra stream into Web Audio and keeps
+separate output contexts for the local ChromeOS speaker and headphones. Each
+context is bound directly to its device with `AudioContext.setSinkId()`.
+
 Run GIMP 3 in its own application-branded PWA. GIMP uses its default
 single-window interface and Cross suppresses the startup splash and first-run
 welcome dialog so the editor becomes the page window directly:
@@ -356,8 +360,10 @@ file-descriptor-carrying X11 extensions are not broken by the proxy.
 Xpra sends window updates to browser canvases and negotiates native browser
 video decoding where available. A private PulseAudio null sink and an explicit
 GStreamer PulseAudio capture source provide speaker audio to the browser; the
-VLC launcher is pinned to its PulseAudio output. Cross restarts a
-browser-blocked stream on the next canvas gesture. Cross forces common
+VLC launcher is pinned to its PulseAudio output. The browser fans that stream
+out through separate Web Audio contexts for detected local speaker and
+headphone devices. Cross restarts a browser-blocked stream on the next canvas
+gesture. Cross forces common
 Wayland-capable toolkits onto their X11 backend for this virtual display
 (`QT_QPA_PLATFORM=xcb`, `GDK_BACKEND=x11`), so the layer does not depend on the
 ChromeOS display server.

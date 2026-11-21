@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-21.67-pulse-probe-recursion"
+SCRIPT_VERSION="2026-11-21.68-multi-output-webaudio"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1248,6 +1248,17 @@ APP_CSS
   cat <<'APP_JS' | sudo tee "$www/cross-app.js" >/dev/null
 (() => {
   const fitted = new Set();
+  const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext;
+  const audioRouting = {
+    configuring: false,
+    retry: false,
+    devicesDirty: false,
+    token: null,
+    context: null,
+    input: null,
+    streamDestination: null,
+    outputs: [],
+  };
   const suppressSoftwareKeyboard = () => {
     const pasteboard = document.getElementById("pasteboard");
     if (!pasteboard) return;
@@ -1286,8 +1297,156 @@ APP_CSS
     }
   };
   const resumeContext = (context) => {
-    if (context && context.state === "suspended" && typeof context.resume === "function") {
+    if (context && context.state !== "running" && context.state !== "closed" &&
+        typeof context.resume === "function") {
       context.resume().catch((error) => console.warn("Cross audio context resume failed:", error));
+    }
+  };
+  const closeOutputRoutes = (routes) => {
+    for (const route of routes) {
+      try {
+        route.source.disconnect();
+      } catch {}
+      if (route.context.state !== "closed") {
+        route.context.close().catch(() => {});
+      }
+    }
+  };
+  const connectInput = () => {
+    const {input, streamDestination} = audioRouting;
+    if (!input || !streamDestination) return;
+    input.disconnect();
+    input.connect(streamDestination);
+  };
+  const clearInputRoute = () => {
+    closeOutputRoutes(audioRouting.outputs);
+    audioRouting.outputs = [];
+    try {
+      audioRouting.input?.disconnect();
+    } catch {}
+    for (const track of audioRouting.streamDestination?.stream?.getTracks?.() || []) {
+      track.stop();
+    }
+    audioRouting.token = null;
+    audioRouting.context = null;
+    audioRouting.input = null;
+    audioRouting.streamDestination = null;
+  };
+  const audioInput = (xpra) => {
+    if (xpra.audio_framework === "aurora") {
+      const device = xpra.audio_aurora_ctx?.device;
+      if (device?.node && device.context) {
+        return {token: device.node, context: device.context, input: device.node};
+      }
+      return null;
+    }
+    if (xpra.audio && typeof xpra.audio.play === "function" && xpra.audio_context) {
+      return {token: xpra.audio, context: xpra.audio_context, element: xpra.audio};
+    }
+    return null;
+  };
+  const outputTargets = async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      throw new Error("audio output enumeration is unavailable");
+    }
+    const devices = (await navigator.mediaDevices.enumerateDevices())
+      .filter((device) => device.kind === "audiooutput");
+    const concrete = devices.filter((device) =>
+      device.deviceId && device.deviceId !== "default" && device.deviceId !== "communications");
+    const speakerPattern = /(?:^|\b)(?:speakers?|internal audio|built-in audio)(?:\b|$)|スピーカー|内蔵(?:音声|オーディオ)/i;
+    const headphonePattern = /(?:^|\b)(?:headphones?|headsets?|earphones?|earbuds?)(?:\b|$)|ヘッド(?:ホン|フォン|セット)|イヤホン/i;
+    const targets = [];
+    const groups = new Set();
+    const addFirst = (pattern) => {
+      const device = concrete.find((candidate) => {
+        const group = candidate.groupId || candidate.deviceId;
+        return pattern.test(candidate.label || "") && !groups.has(group);
+      });
+      if (!device) return;
+      groups.add(device.groupId || device.deviceId);
+      targets.push({deviceId: device.deviceId, label: device.label || device.deviceId});
+    };
+    addFirst(speakerPattern);
+    addFirst(headphonePattern);
+    return targets;
+  };
+  const createOutputRoute = async (stream, target) => {
+    const context = new AudioContextClass();
+    try {
+      if (target.deviceId) {
+        if (typeof context.setSinkId !== "function") throw new Error("AudioContext.setSinkId is unavailable");
+        await context.setSinkId(target.deviceId);
+      }
+      const source = context.createMediaStreamSource(stream);
+      source.connect(context.destination);
+      resumeContext(context);
+      return {context, source, target};
+    } catch (error) {
+      if (context.state !== "closed") await context.close().catch(() => {});
+      throw error;
+    }
+  };
+  const rebuildOutputRoutes = async () => {
+    const stream = audioRouting.streamDestination?.stream;
+    if (!stream || !AudioContextClass) return;
+    try {
+      const targets = await outputTargets();
+      const routes = [];
+      for (const target of targets) {
+        try {
+          routes.push(await createOutputRoute(stream, target));
+        } catch (error) {
+          console.warn(`Cross audio output route failed for ${target.label}:`, error);
+        }
+      }
+      const previous = audioRouting.outputs;
+      audioRouting.outputs = routes;
+      connectInput();
+      closeOutputRoutes(previous);
+    } catch (error) {
+      console.warn("Cross audio output enumeration failed:", error);
+    }
+  };
+  const ensureAudioRouting = async (xpra, refreshDevices = false) => {
+    if (!AudioContextClass) return;
+    if (refreshDevices) audioRouting.devicesDirty = true;
+    if (audioRouting.configuring) {
+      audioRouting.retry = true;
+      return;
+    }
+    audioRouting.configuring = true;
+    try {
+      const candidate = audioInput(xpra);
+      if (!candidate) return;
+      if (audioRouting.token !== candidate.token) {
+        clearInputRoute();
+        const streamDestination = candidate.context.createMediaStreamDestination();
+        let input = candidate.input;
+        if (!input) input = candidate.context.createMediaElementSource(candidate.element);
+        audioRouting.token = candidate.token;
+        audioRouting.context = candidate.context;
+        audioRouting.input = input;
+        audioRouting.streamDestination = streamDestination;
+        connectInput();
+        audioRouting.devicesDirty = true;
+      }
+      if (audioRouting.devicesDirty || !audioRouting.outputs.length) {
+        audioRouting.devicesDirty = false;
+        await rebuildOutputRoutes();
+      }
+      resumeContext(audioRouting.context);
+      for (const route of audioRouting.outputs) resumeContext(route.context);
+    } catch (error) {
+      console.warn("Cross Web Audio routing failed:", error);
+      try {
+        connectInput();
+      } catch {}
+    } finally {
+      audioRouting.configuring = false;
+      if (audioRouting.retry) {
+        audioRouting.retry = false;
+        setTimeout(() => ensureAudioRouting(getXpraClient()), 0);
+      }
     }
   };
   const activateInputAndAudio = () => {
@@ -1302,7 +1461,8 @@ APP_CSS
 
     resumeContext(xpra.audio_context);
     if (xpra.audio_enabled && xpra.audio_state !== "disabled") {
-      if (!xpra.audio && typeof xpra._sound_start_receiving === "function") {
+      if (!xpra.audio && !xpra.audio_aurora_ctx &&
+          typeof xpra._sound_start_receiving === "function") {
         try {
           xpra._sound_start_receiving();
         } catch (error) {
@@ -1312,7 +1472,15 @@ APP_CSS
       if (xpra.audio && xpra.audio.paused) {
         xpra.audio.play().catch((error) => console.warn("Cross audio unlock failed:", error));
       }
-      resumeContext(xpra.audio_aurora_ctx && xpra.audio_aurora_ctx.context);
+      if (xpra.audio_aurora_ctx && !xpra.audio_aurora_ctx.playing) {
+        try {
+          xpra.audio_aurora_ctx.play();
+        } catch (error) {
+          console.warn("Cross Aurora audio unlock failed:", error);
+        }
+      }
+      resumeContext(xpra.audio_aurora_ctx?.device?.context);
+      ensureAudioRouting(xpra);
     }
 
     document.getElementById("cross-input-hint")?.remove();
@@ -1337,7 +1505,17 @@ APP_CSS
   addEventListener("touchstart", activateInputAndAudio, true);
   addEventListener("keydown", activateInputAndAudio, true);
   addEventListener("resize", fitApplicationWindow);
+  navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+    const xpra = getXpraClient();
+    if (xpra) ensureAudioRouting(xpra, true);
+  });
   setInterval(fitApplicationWindow, 150);
+  setInterval(() => {
+    const xpra = getXpraClient();
+    if (xpra?.connected && xpra.audio_enabled && xpra.audio_state !== "disabled") {
+      ensureAudioRouting(xpra);
+    }
+  }, 250);
 })();
 APP_JS
   cat <<'ROUTER' | sudo tee "$CROSS_ROOT/usr/local/libexec/cross-desktop-router" >/dev/null
@@ -4483,6 +4661,16 @@ C_SOURCE
     grep -Fqx "keyboard = false" \
       /usr/local/share/cross-desktop/www/default-settings.txt
     grep -Fq "activateInputAndAudio" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq "createMediaElementSource" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq "createMediaStreamDestination" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq "createMediaStreamSource" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq "context.setSinkId" \
+      /usr/local/share/cross-desktop/www/cross-app.js
+    grep -Fq "audio_aurora_ctx?.device?.context" \
       /usr/local/share/cross-desktop/www/cross-app.js
     grep -Fq "virtualkeyboardpolicy" \
       /usr/local/share/cross-desktop/www/cross-app.js

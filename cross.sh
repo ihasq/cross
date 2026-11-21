@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-20.66-private-pulseaudio"
+SCRIPT_VERSION="2026-11-21.67-pulse-probe-recursion"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -2347,6 +2347,12 @@ application_kind() {
     *) printf '%s\n' generic ;;
   esac
 }
+is_pulse_cli() {
+  case "${1##*/}" in
+    pacat|pacmd|pactl|pamon|paplay|parec) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 find_desktop_file() {
   local executable=$1 base=${1##*/} desktop exec_line
   if [[ -r "/usr/share/applications/$base.desktop" ]]; then
@@ -2547,7 +2553,7 @@ classify_proxy_pid() {
     case "$base" in
       dbus-launch|gdbus|dbus-send|pax11publish|at-spi-bus-launcher|at-spi2-registryd|ibus-daemon|bwrap)
         ;;
-      bash|sh|dash|zsh|fish|xprop|xclip|xsel|xdotool|xwininfo|xlsclients|xrandr|xrdb)
+      bash|sh|dash|zsh|fish|pacat|pacmd|pactl|pamon|paplay|parec|xprop|xclip|xsel|xdotool|xwininfo|xlsclients|xrandr|xrdb)
         candidate="$(resolve_executable /usr/bin/xterm)"
         candidate_pid=$peer_pid
         candidate_start="$(proxy_pid_identity "$peer_pid")"
@@ -2596,7 +2602,8 @@ publish_app_session_environment() {
           -S "$dbus_socket" &&
           -s "$cookie_file" ]] &&
        /usr/bin/xauth list ":$display" 2>/dev/null | grep -q 'MIT-MAGIC-COOKIE-1' &&
-       env PULSE_SERVER="unix:$pulse_socket" PULSE_COOKIE="$cookie_file" \
+       env -u DISPLAY -u XAUTHORITY \
+         PULSE_SERVER="unix:$pulse_socket" PULSE_COOKIE="$cookie_file" \
          /usr/bin/timeout 1 /usr/bin/pactl info >/dev/null 2>&1; then
       if env DISPLAY=":$display" XAUTHORITY="$XAUTHORITY" \
           PULSE_SERVER="unix:$pulse_socket" PULSE_COOKIE="$cookie_file" \
@@ -2889,6 +2896,23 @@ open_targets() {
     launch_for_app "$application" /usr/local/libexec/cross-open-target "$target"
   done
 }
+retire_pulse_cli_session() {
+  local app_dir=$1 pid display attempt
+  pid="$(valid_pid_file "$app_dir/xpra.pid" xpra 2>/dev/null || true)"
+  if [[ -n "$pid" ]]; then
+    display="$(<"$app_dir/display")"
+    printf 'cross desktop: retiring invalid PulseAudio utility session %s\n' \
+      "$(<"$app_dir/name")" >&2
+    /usr/bin/xpra stop ":$display" --socket-dir="$SOCKET_DIR" >/dev/null 2>&1 \
+      || kill -TERM "$pid" 2>/dev/null || true
+    for ((attempt=1; attempt<=50; attempt++)); do
+      pid_running "$pid" || break
+      sleep 0.1
+    done
+    pid_running "$pid" && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$app_dir/xpra.pid" "$app_dir/restore-app" "$app_dir/proxy-open.token"
+}
 start_server() {
   local executable default_dir app_dir found=0
   prepare
@@ -2899,6 +2923,11 @@ start_server() {
     || record_restore_command "$default_dir" /usr/bin/xterm
   for app_dir in "$APPS_DIR"/*; do
     [[ -d "$app_dir" && -r "$app_dir/executable" ]] || continue
+    executable="$(<"$app_dir/executable")"
+    if is_pulse_cli "$executable"; then
+      retire_pulse_cli_session "$app_dir"
+      continue
+    fi
     start_app_session "$app_dir"
     if (( SESSION_STARTED )); then launch_restore_command "$app_dir"; fi
     ((found += 1))
@@ -4458,6 +4487,10 @@ C_SOURCE
     grep -Fq "virtualkeyboardpolicy" \
       /usr/local/share/cross-desktop/www/cross-app.js
     grep -Fq -- "--audio-source=pulse" /usr/local/libexec/cross-desktop
+    grep -Fq "env -u DISPLAY -u XAUTHORITY" \
+      /usr/local/libexec/cross-desktop
+    grep -Fq "pacat|pacmd|pactl|pamon|paplay|parec" \
+      /usr/local/libexec/cross-desktop
     grep -Fq -- "--socket-dirs=\"\$SOCKET_DIR\"" /usr/local/libexec/cross-desktop
     grep -Fq -- "--ssh-upgrade=no" /usr/local/libexec/cross-desktop
     grep -Fq -- "--opengl=no" /usr/local/libexec/cross-desktop

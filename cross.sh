@@ -227,33 +227,6 @@ mount_bind() {
 
 mount_file_bind() {
   local source="$1" target="$2"
-
-  [[ -S "$source" ]] \
-    || die "bind-mount source is not a socket: $source"
-
-  sudo mkdir -p "$(dirname -- "$target")"
-
-  if ! is_mounted "$target"; then
-    [[ ! -L "$target" ]] \
-      || die "refusing symlinked bind-mount target: $target"
-
-    if [[ ! -e "$target" ]]; then
-      sudo touch "$target"
-    fi
-
-    [[ -f "$target" ]] \
-      || die "bind-mount target is not a regular file: $target"
-
-    sudo mount --bind "$source" "$target" \
-      || die "failed to bind-mount $source to $target"
-  fi
-
-  [[ -S "$target" ]] \
-    || die "bind-mounted target is not a socket: $target"
-}
-
-mount_file_bind() {
-  local source="$1" target="$2"
   [[ -e "$source" ]] || die "bind-mount source is missing: $source"
   sudo mkdir -p "$(dirname -- "$target")"
   if ! is_mounted "$target"; then
@@ -1377,6 +1350,33 @@ mount_bind() {
       sudo mount --bind "$source" "$target"
     fi
   fi
+}
+
+mount_file_bind() {
+  local source="$1" target="$2"
+
+  [[ -S "$source" ]] \
+    || die "bind-mount source is not a socket: $source"
+
+  sudo mkdir -p -- "$(dirname -- "$target")"
+
+  if ! is_mounted "$target"; then
+    [[ ! -L "$target" ]] \
+      || die "refusing symlinked bind-mount target: $target"
+
+    if [[ ! -e "$target" ]]; then
+      sudo touch -- "$target"
+    fi
+
+    [[ -f "$target" ]] \
+      || die "bind-mount target is not a regular file: $target"
+
+    sudo mount --bind "$source" "$target" \
+      || die "failed to bind-mount $source to $target"
+  fi
+
+  [[ -S "$target" ]] \
+    || die "bind-mounted target is not a socket: $target"
 }
 
 mount_proc() {

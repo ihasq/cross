@@ -152,18 +152,21 @@ CMake, Meson, Autotools, Rust tools, and Node.js tools. `bash`, `sh`, `curl`,
 and `wget` intentionally remain the ChromeOS host commands so the installer can
 be updated even when the Cross service is stopped.
 
-### Open URLs
+### Open files and URLs
 
-Inside Cross, `xdg-open` sends one URL to ChromeOS's system D-Bus URL handler:
+Inside Cross, `xdg-open` uses the same CLI as Alpine's packaged command and
+sends the requested file or URL to ChromeOS's system D-Bus URL handler:
 
 ```bash
 xdg-open https://example.com
-xdg-open 'my-app://open/item/42'
+xdg-open "$HOME/Documents/example.pdf"
 ```
 
-The bridge leaves scheme validation to ChromeOS, allowing web links and custom
-application links. The same command is available as a Crosh-side wrapper after
-reloading `~/.bashrc`.
+The bridge supports `--help`, `--manual`, and `--version`, and preserves the
+standard `xdg-open` failure status categories. It leaves scheme validation to
+ChromeOS, which can reject unsupported URLs. Local paths are converted to
+`file:` URLs before being sent. The same command is available as a Crosh-side
+wrapper after reloading `~/.bashrc`.
 
 ### Working directories
 

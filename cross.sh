@@ -20,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-22.72-fix-dbus-mount"
+SCRIPT_VERSION="2026-11-27.73-xdg-open-cli"
 ALPINE_VERSION="3.24.1"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -1040,26 +1040,97 @@ remove_legacy_gui_components() {
 }
 
 configure_xdg_open() {
-  info "Configuring ChromeOS URL bridge"
+  info "Configuring ChromeOS xdg-open bridge"
   sudo mkdir -p "$CROSS_ROOT/usr/local/bin"
   cat <<'XDG_OPEN' | sudo tee "$CROSS_ROOT/usr/local/bin/xdg-open" >/dev/null
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-  echo 'usage: xdg-open URL' >&2
-  exit 2
+real_xdg_open=/usr/bin/xdg-open
+
+# Let the packaged xdg-open own its public help, manual, version, and syntax
+# diagnostics. This keeps the bridge's CLI in step with Alpine's xdg-utils.
+delegate_cli() {
+  [ -x "$real_xdg_open" ] || {
+    echo 'xdg-open: packaged xdg-open is unavailable' >&2
+    exit 3
+  }
+  exec "$real_xdg_open" "$@"
+}
+
+for argument in "$@"; do
+  case "$argument" in
+    --help|--manual|--version) delegate_cli "$@" ;;
+  esac
+done
+
+[ "$#" -eq 1 ] || delegate_cli "$@"
+[ -n "$1" ] || delegate_cli "$@"
+case "$1" in
+  -*) delegate_cli "$@" ;;
+esac
+
+target=$1
+file=
+url=
+
+if printf '%s\n' "$target" | grep -Eq '^[[:alpha:]][[:alpha:][:digit:]+.-]*:'; then
+  case "$target" in
+    file://*)
+      [ -x /usr/bin/python3 ] || {
+        echo 'xdg-open: python3 is unavailable' >&2
+        exit 3
+      }
+      file=$(/usr/bin/python3 - "$target" <<'PYTHON_FILE_URL'
+import socket
+import sys
+from urllib.parse import unquote, urlsplit
+
+url = urlsplit(sys.argv[1])
+if url.netloc in ("", "localhost", socket.gethostname()):
+    path = url.path
+else:
+    path = url.netloc + url.path
+print(unquote(path))
+PYTHON_FILE_URL
+      )
+      ;;
+    *) url=$target ;;
+  esac
+else
+  file=$target
 fi
-url=$1
+
+if [ -n "$file" ]; then
+  [ -e "$file" ] || {
+    printf "xdg-open: file '%s' does not exist\n" "$file" >&2
+    exit 2
+  }
+  [ -r "$file" ] || {
+    printf "xdg-open: no permission to read file '%s'\n" "$file" >&2
+    exit 5
+  }
+  [ -x /usr/bin/python3 ] || {
+    echo 'xdg-open: python3 is unavailable' >&2
+    exit 3
+  }
+  url=$(/usr/bin/python3 - "$file" <<'PYTHON_PATH_URL'
+import pathlib
+import sys
+
+print(pathlib.Path(sys.argv[1]).resolve().as_uri())
+PYTHON_PATH_URL
+  )
+fi
 
 unset LD_PRELOAD DBUS_SYSTEM_BUS_ADDRESS
 [ -S /run/dbus/system_bus_socket ] || {
   echo 'xdg-open: ChromeOS system D-Bus socket is unavailable' >&2
-  exit 1
+  exit 4
 }
 [ -x /usr/bin/dbus-send ] || {
   echo 'xdg-open: dbus-send is unavailable' >&2
-  exit 1
+  exit 3
 }
 
 if ! reply=$(/usr/bin/dbus-send --system --type=method_call --print-reply \
@@ -1068,7 +1139,7 @@ if ! reply=$(/usr/bin/dbus-send --system --type=method_call --print-reply \
     org.chromium.UrlHandlerServiceInterface.OpenUrl \
     "string:$url" 2>&1); then
   printf 'xdg-open: ChromeOS rejected %s\n%s\n' "$url" "$reply" >&2
-  exit 1
+  exit 4
 fi
 XDG_OPEN
   sudo chown root:root "$CROSS_ROOT/usr/local/bin/xdg-open"
@@ -2188,7 +2259,15 @@ validate() {
     for cli in git curl nano vim ffmpeg gcc make abuild rustup rustc cargo node npm npx xdg-open dbus-send; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
-    test "$(command -v xdg-open)" = /usr/local/bin/xdg-open
+    test "$(command -v xdg-open)" = /usr/local/bin/xdg-open || exit 1
+    test -x /usr/bin/xdg-open || exit 1
+    xdg-open --help >/dev/null || exit 1
+    xdg-open --manual >/dev/null || exit 1
+    xdg-open --version >/dev/null || exit 1
+    if xdg-open >/dev/null 2>&1; then exit 1; else test "$?" -eq 1 || exit 1; fi
+    missing=/tmp/.cross-xdg-open-missing-$$
+    test ! -e "$missing" || exit 1
+    if xdg-open "$missing" >/dev/null 2>&1; then exit 1; else test "$?" -eq 2 || exit 1; fi
     test -S /run/dbus/system_bus_socket
     for cli in xpra vlc gimp xterm; do
       ! command -v "$cli" >/dev/null 2>&1 || exit 1

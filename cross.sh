@@ -741,7 +741,7 @@ install_alpine_packages() {
     bash ca-certificates coreutils findutils diffutils grep sed gawk python3
     tar gzip bzip2 xz zstd file patch nano vim ffmpeg
     git git-init-template curl openssh-client openssh-server
-    build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
+    alpine-sdk build-base linux-headers pkgconf cmake samurai meson autoconf automake libtool
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec dbus xdg-utils
@@ -2185,7 +2185,7 @@ validate() {
   [[ -x "$CROSS_BIN/xdg-open" ]] || die "xdg-open host wrapper is missing"
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make rustup rustc cargo node npm npx xdg-open dbus-send; do
+    for cli in git curl nano vim ffmpeg gcc make abuild rustup rustc cargo node npm npx xdg-open dbus-send; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
     test "$(command -v xdg-open)" = /usr/local/bin/xdg-open

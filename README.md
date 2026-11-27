@@ -35,8 +35,8 @@ includes:
 
 - Bash, Git, curl, OpenSSH, Nano, Vim, FFmpeg, and standard GNU command-line
   utilities
-- GCC, binutils, musl headers, CMake, Meson, Samurai, Autoconf, Automake, and
-  Libtool
+- Alpine SDK (`abuild` included), GCC, binutils, musl headers, CMake, Meson,
+  Samurai, Autoconf, Automake, and Libtool
 - Rust, Cargo, rustup, rustfmt, and Clippy
 - Node.js, npm, and npx
 - The latest GNU libc runtime compatibility for x86_64 and aarch64 binaries

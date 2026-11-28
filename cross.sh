@@ -11,19 +11,19 @@
 # execution probe fails after mount flags have been corrected.
 #
 # Run from VT-2 as chronos: bash ~/Downloads/cross.sh
-# After setup the service starts immediately and, when supported, at every
-# ChromeOS boot. On a stock verified image, setup disables rootfs verification;
-# a post-reboot rerun installs the Upstart job under /etc/init. If unavailable,
-# setup completes with manual startup after reboot.
+# After setup the service starts immediately. An Upstart job is installed only
+# when /etc/init is already writable; Cross never changes verified-boot state.
 # Then: source ~/.bashrc; cross; cargo run; code serve-web (if installed).
 
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-27.73-xdg-open-cli"
-ALPINE_VERSION="3.24.1"
+SCRIPT_VERSION="2026-11-28.74-lifecycle-hardening"
+ALPINE_VERSION="3.24.4"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
+ALPINE_MINIROOTFS_SHA256_X86_64="cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012"
+ALPINE_MINIROOTFS_SHA256_AARCH64="4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de"
 GLIBC_VERSION=""
 GLIBC_DEBIAN_VERSION=""
 INITIAL_DOWNLOAD_JOBS=6
@@ -48,6 +48,13 @@ HOST_SSH_BIN=""
 ROOTFS_MOUNTED=()
 SETUP_STARTED=0
 BOOT_AUTOSTART_AVAILABLE=0
+SETUP_LOCK="${HOME:-/home/chronos/user}/.cross-setup.lock"
+SETUP_LOCK_HELD=0
+TRANSACTION_ACTIVE=0
+TRANSACTION_DIR=""
+SERVICE_WAS_RUNNING=0
+HAD_COMPLETE_INSTALL=0
+PROFILE_CHANGED=0
 
 info() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -76,7 +83,7 @@ require_vt2_eula_context() {
   local nnp
   (( EUID != 0 )) || die "run as chronos, not as root"
   if [[ -n "${CROSS_SESSION:-}" ]]; then
-    die "cross.sh is running inside Alpine; update once with: /usr/bin/curl https://cross-sh.pages.dev/cross.sh | /bin/bash"
+    die "cross.sh is running inside Alpine; download, verify, and run it from ChromeOS VT-2"
   fi
   [[ -f /etc/lsb-release ]] || die "this does not look like the ChromeOS host"
   have sudo || die "sudo is required; run from VT-2 in Developer Mode"
@@ -114,18 +121,20 @@ Cross is a successor project to Chromebrew. By accepting, you agree:
 5. Cross is provided "AS IS" without warranties, to the extent permitted by
    law. Alpine and other third-party software retain their own licenses.
 
-6. Cross boot autostart requires an Upstart job under /etc/init. On a stock
-   ChromeOS release image, setup uses ChromeOS's make_dev_ssd.sh tool to disable
-   rootfs verification, then requires a reboot and a second setup run only to
-   add autostart. This weakens verified boot, can affect OS updates, and may
-   require recovery media to restore the device. Hardware write protection is
-   not changed. Cross setup continues if autostart cannot be configured safely.
+6. Cross installs an Upstart boot job only when /etc/init is already writable.
+   It never disables ChromeOS rootfs verification. On stock verified images the
+   service must be started manually from VT-2 after reboot.
 
-7. Cross exposes ChromeOS's system D-Bus socket inside Alpine so `xdg-open`
-   can ask ChromeOS to open URLs. Alpine processes running as the ChromeOS user
-   can access that exposed socket.
+7. Cross exposes a read-only bind of ChromeOS's system D-Bus socket inside
+   Alpine so `xdg-open` can ask ChromeOS to open URLs. Socket clients can still
+   invoke any bus method permitted to the ChromeOS user; read-only mount flags
+   are not a D-Bus authorization boundary.
 
-8. Acceptance authorizes the operations above. Otherwise setup will exit.
+8. A chroot is not an isolation boundary. Because Cross shares the host kernel,
+   PID namespace and privileged kernel interfaces, root inside Cross may have
+   host-root-equivalent impact. Do not run untrusted privileged code.
+
+9. Acceptance authorizes the operations above. Otherwise setup will exit.
 CROSS_EULA
   while :; do
     printf '\nDo you accept the Cross EULA? [y/n]: ' >/dev/tty
@@ -149,9 +158,103 @@ release_setup_mounts() {
   ROOTFS_MOUNTED=()
 }
 
+acquire_setup_lock() {
+  local owner=""
+  if ! mkdir "$SETUP_LOCK" 2>/dev/null; then
+    [[ -r "$SETUP_LOCK/pid" ]] && read -r owner < "$SETUP_LOCK/pid" || true
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf -- "$SETUP_LOCK"
+      mkdir "$SETUP_LOCK" || die "cannot acquire setup lock: $SETUP_LOCK"
+    else
+      die "another Cross setup is active${owner:+ (pid $owner)}"
+    fi
+  fi
+  printf '%s\n' "$$" > "$SETUP_LOCK/pid"
+  SETUP_LOCK_HELD=1
+}
+
+begin_transaction() {
+  rootfs_is_resumable || return 0
+  local used_kib free_kib
+  used_kib="$(sudo du -sk "$CROSS_ROOT" | awk '{print $1}')"
+  free_kib="$(df -Pk "$CROSS_PREFIX" | awk 'NR==2 {print $4}')"
+  [[ "$used_kib" =~ ^[0-9]+$ && "$free_kib" =~ ^[0-9]+$ ]] \
+    || die "cannot determine space required for rollback snapshot"
+  (( free_kib > used_kib + 524288 )) \
+    || die "insufficient free space for rollback snapshot; run cross prune or move a backup"
+  TRANSACTION_DIR="$CROSS_PREFIX/.rollback-$(date +%Y%m%d-%H%M%S)-$$"
+  info "Creating pre-update rollback snapshot"
+  sudo mkdir -p "$TRANSACTION_DIR"
+  sudo chmod 0700 "$TRANSACTION_DIR"
+  local path name
+  for path in "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_ETC"; do
+    [[ -e "$path" ]] || continue
+    name="${path##*/}"
+    sudo cp -a -- "$path" "$TRANSACTION_DIR/$name"
+  done
+  [[ ! -e "$CROSS_COMPLETE" ]] || sudo cp -a -- "$CROSS_COMPLETE" "$TRANSACTION_DIR/complete"
+  TRANSACTION_ACTIVE=1
+}
+
+rollback_transaction() {
+  (( TRANSACTION_ACTIVE )) || return 0
+  warn "Setup failed; restoring the pre-update Cross snapshot"
+  release_setup_mounts
+  if [[ ! -d "$TRANSACTION_DIR/alpine" || ! -d "$TRANSACTION_DIR/bin" || ! -d "$TRANSACTION_DIR/etc" ]]; then
+    warn "rollback snapshot is incomplete; preserving the failed tree and snapshot for manual recovery"
+    TRANSACTION_ACTIVE=0
+    return 1
+  fi
+  sudo rm -rf -- "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_ETC"
+  [[ ! -e "$TRANSACTION_DIR/alpine" ]] || sudo cp -a -- "$TRANSACTION_DIR/alpine" "$CROSS_ROOT"
+  [[ ! -e "$TRANSACTION_DIR/bin" ]] || sudo cp -a -- "$TRANSACTION_DIR/bin" "$CROSS_BIN"
+  [[ ! -e "$TRANSACTION_DIR/etc" ]] || sudo cp -a -- "$TRANSACTION_DIR/etc" "$CROSS_ETC"
+  if [[ -e "$TRANSACTION_DIR/complete" ]]; then
+    sudo cp -a -- "$TRANSACTION_DIR/complete" "$CROSS_COMPLETE"
+  else
+    sudo rm -f -- "$CROSS_COMPLETE"
+  fi
+  sudo rm -rf -- "$TRANSACTION_DIR"
+  TRANSACTION_ACTIVE=0
+  if (( SERVICE_WAS_RUNNING )) && [[ -x "$CROSS_BIN/cross-service" ]]; then
+    "$CROSS_BIN/cross-service" start >/dev/null 2>&1 || warn "old service could not be restarted automatically"
+  fi
+}
+
+commit_transaction() {
+  (( TRANSACTION_ACTIVE )) || return 0
+  TRANSACTION_ACTIVE=0
+  sudo rm -rf -- "$TRANSACTION_DIR" || warn "could not remove completed rollback snapshot: $TRANSACTION_DIR"
+}
+
+remove_host_profile_blocks() {
+  local file tmp
+  for file in "${HOME:-/home/chronos/user}/.bashrc" "${HOME:-/home/chronos/user}/.bash_profile"; do
+    [[ -f "$file" ]] || continue
+    tmp="$(mktemp "${file}.cross-cleanup.XXXXXXXX")"
+    awk '
+      $0 == "# >>> cross-alpine >>>" { skip=1; next }
+      $0 == "# <<< cross-alpine <<<" { skip=0; next }
+      !skip { print }
+    ' "$file" > "$tmp"
+    chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+    mv -f -- "$tmp" "$file"
+  done
+}
+
 cleanup() {
   local status=$?
   release_setup_mounts
+  if (( status != 0 )); then
+    rollback_transaction || true
+  fi
+  if (( status != 0 && HAD_COMPLETE_INSTALL == 0 && PROFILE_CHANGED != 0 )); then
+    remove_host_profile_blocks
+  fi
+  if (( SETUP_LOCK_HELD )); then
+    rm -rf -- "$SETUP_LOCK"
+    SETUP_LOCK_HELD=0
+  fi
   if (( status != 0 && SETUP_STARTED != 0 )); then
     printf '\nSetup failed. Log: %s\n' "$LOG_FILE" >&2
   fi
@@ -356,6 +459,8 @@ preflight() {
   info "cross.sh $SCRIPT_VERSION"
   info "Preflight checks"
   (( EUID != 0 )) || die "run as chronos, not as root"
+  [[ "$(id -un)" == chronos ]] || die "Cross currently supports only the ChromeOS chronos user"
+  [[ "${HOME:-}" == /home/chronos/* ]] || die "unexpected chronos HOME: ${HOME:-unset}"
   [[ -f /etc/lsb-release ]] || die "this does not look like ChromeOS"
   have sudo || die "sudo is required"
   have tar || die "tar is required"
@@ -381,7 +486,7 @@ preflight() {
   fi
   [[ -n "$HOST_SSH_BIN" ]] || die "host OpenSSH client required"
   "$HOST_SSH_BIN" -V >/dev/null 2>&1 || die "host SSH unusable: $HOST_SSH_BIN"
-  local nnp opts free_kib
+  local nnp opts free_kib mount_target
   nnp="$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null || true)"
   [[ "$nnp" != 1 ]] || die "NoNewPrivs active; use VT-2"
   sudo true
@@ -411,15 +516,17 @@ preflight() {
   esac
   [[ "$CROSS_PREFIX" == /* && "$CROSS_PREFIX" != *[[:space:]]* ]] \
     || die "CROSS_PREFIX must be an absolute path without whitespace"
-  [[ "$CROSS_SSH_PORT" =~ ^[0-9]+$ ]] &&
-    (( CROSS_SSH_PORT >= 1024 && CROSS_SSH_PORT <= 65535 )) \
-    || die "CROSS_SSH_PORT must be 1024..65535"
-  opts="$(awk '$2 == "/usr/local" {print $4}' /proc/mounts | tail -n1)"
-  [[ ",$opts," != *,noexec,* ]] || die "/usr/local is noexec"
-  [[ ",$opts," != *,nosuid,* ]] || die "/usr/local nosuid; Alpine sudo needs setuid"
-  free_kib="$(df -Pk /usr/local | awk 'NR==2 {print $4}')"
+  if [[ ! "$CROSS_SSH_PORT" =~ ^[0-9]+$ ]] \
+      || (( CROSS_SSH_PORT < 1024 || CROSS_SSH_PORT > 65535 )); then
+    die "CROSS_SSH_PORT must be 1024..65535"
+  fi
+  mount_target="$(df -P "$(dirname -- "$CROSS_PREFIX")" | awk 'NR==2 {print $6}')"
+  opts="$(awk -v target="$mount_target" '$2 == target {print $4}' /proc/mounts | tail -n1)"
+  [[ ",$opts," != *,noexec,* ]] || die "$mount_target is noexec"
+  [[ ",$opts," != *,nosuid,* ]] || die "$mount_target is nosuid; Alpine sudo needs setuid"
+  free_kib="$(df -Pk "$(dirname -- "$CROSS_PREFIX")" | awk 'NR==2 {print $4}')"
   [[ "$free_kib" =~ ^[0-9]+$ ]] || free_kib=0
-  (( free_kib >= 1200000 )) || die "at least 1.2 GiB free space under /usr/local required"
+  (( free_kib >= 2400000 )) || die "at least 2.4 GiB free space is required for transactional setup"
   printf 'Architecture: %s\nAlpine: %s\nPrefix: %s\nHost SSH: %s\nSSH port: %s\n' \
     "$ALPINE_ARCH" "$ALPINE_VERSION" "$CROSS_PREFIX" "$HOST_SSH_BIN" "$CROSS_SSH_PORT"
 }
@@ -430,7 +537,8 @@ reset_or_prepare_prefix() {
   if [[ -d "$CROSS_PREFIX" && ! -f "$CROSS_MARKER" ]]; then
     if [[ -d "$CROSS_PREFIX/var/db/cross" || -d "$CROSS_PREFIX/opt/zig-0.16.0" ]] \
       || compgen -G "$CROSS_PREFIX/opt/alpine-make-*" >/dev/null; then
-      local backup="${CROSS_PREFIX}.source-build-backup-$(date +%Y%m%d-%H%M%S)"
+      local backup
+      backup="${CROSS_PREFIX}.source-build-backup-$(date +%Y%m%d-%H%M%S)"
       warn "Moving previous source-built environment to $backup"
       sudo mv "$CROSS_PREFIX" "$backup"
     elif [[ -n "$(find "$CROSS_PREFIX" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -457,6 +565,9 @@ reset_or_prepare_prefix() {
 quiesce_existing_service() {
   if [[ -x "$CROSS_BIN/cross-service" && -r "$CROSS_ETC/cross.conf" ]]; then
     info "Stopping existing cross service for maintenance"
+    if "$CROSS_BIN/cross-service" status >/dev/null 2>&1; then
+      SERVICE_WAS_RUNNING=1
+    fi
     "$CROSS_BIN/cross-service" stop
   fi
 }
@@ -465,14 +576,7 @@ rootfs_is_resumable() {
   [[ -f "$CROSS_ROOT/lib/apk/db/installed" ]] \
     && [[ -x "$CROSS_ROOT/bin/busybox" ]] \
     && [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/git" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/gcc" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/make" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/rustc" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/cargo" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/node" ]] \
-    && [[ -x "$CROSS_ROOT/usr/bin/npm" ]] \
-    && [[ -x "$CROSS_ROOT/sbin/su-exec" ]]
+    && [[ -d "$CROSS_ROOT/etc/apk" ]]
 }
 
 # Never recursively delete a rootfs with lingering bind mounts (especially HOME).
@@ -483,37 +587,40 @@ assert_rootfs_unmounted_before_removal() {
 }
 
 download_and_extract_rootfs() {
-  local base archive sumfile expected actual version_file
+  local base archive expected actual version_file recovery installed_release
   base="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ALPINE_ARCH}"
   archive="$CROSS_CACHE/alpine-minirootfs-${ALPINE_VERSION}-${ALPINE_ARCH}.tar.gz"
-  sumfile="$archive.sha256"
   version_file="$CROSS_ROOT/etc/alpine-release"
-  if [[ -f "$version_file" && "$(cat "$version_file")" == "$ALPINE_VERSION" ]]; then
-    if rootfs_is_resumable; then
-      if [[ -f "$CROSS_COMPLETE" ]]; then
-        info "Alpine minirootfs $ALPINE_VERSION already installed"
-      else
-        warn "Resuming populated but unvalidated Alpine setup"
-      fi
-      return 0
-    fi
+  if rootfs_is_resumable; then
+    installed_release="$(cat "$version_file" 2>/dev/null || true)"
+    [[ "${installed_release%.*}" == "${ALPINE_VERSION%.*}" ]] \
+      || die "automatic Alpine branch migration from ${installed_release:-unknown} to $ALPINE_VERSION is unsupported; rootfs was left unchanged"
+    info "Preserving installed Alpine rootfs ($installed_release); package upgrade is in-place"
+    return 0
+  fi
+  if [[ -f "$version_file" ]]; then
     if [[ -f "$CROSS_COMPLETE" ]]; then
       warn "Completion marker found, but required Alpine commands are missing"
     else
       warn "Incomplete Alpine rootfs found"
     fi
-    warn "Rebuilding incomplete Alpine rootfs"
+    recovery="$CROSS_PREFIX/recovery/alpine-incomplete-$(date +%Y%m%d-%H%M%S)"
+    warn "Moving incomplete Alpine rootfs to $recovery"
+    assert_rootfs_unmounted_before_removal
+    sudo mkdir -p "$CROSS_PREFIX/recovery"
+    sudo mv -- "$CROSS_ROOT" "$recovery"
   fi
-  fetch "$base/${archive##*/}.sha256" "$sumfile"
   fetch "$base/${archive##*/}" "$archive"
-  expected="$(awk 'NF {print $1; exit}' "$sumfile")"
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid Alpine SHA-256 file"
+  case "$ALPINE_ARCH" in
+    x86_64) expected="$ALPINE_MINIROOTFS_SHA256_X86_64" ;;
+    aarch64) expected="$ALPINE_MINIROOTFS_SHA256_AARCH64" ;;
+    *) die "no pinned Alpine minirootfs digest for $ALPINE_ARCH" ;;
+  esac
   actual="$(sha256_file "$archive")"
-  [[ "${actual,,}" == "${expected,,}" ]] || { rm -f "$archive"; die "SHA-256 mismatch"; }
+  [[ "${actual,,}" == "${expected,,}" ]] || { rm -f "$archive"; die "pinned Alpine minirootfs SHA-256 mismatch"; }
   assert_rootfs_unmounted_before_removal
   info "Extracting Alpine minirootfs $ALPINE_VERSION"
   sudo rm -f "$CROSS_COMPLETE"
-  sudo rm -rf "$CROSS_ROOT"
   sudo mkdir -p "$CROSS_ROOT"
   sudo tar -xzf "$archive" -C "$CROSS_ROOT"
   sudo chown root:root "$CROSS_ROOT"
@@ -521,17 +628,28 @@ download_and_extract_rootfs() {
 
 configure_rootfs() {
   info "Configuring Alpine repositories"
+  local repository repositories_file="$CROSS_ROOT/etc/apk/repositories"
+  local -a managed_repositories=(
+    "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main"
+    "https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community"
+  )
   sudo mkdir -p "$CROSS_ROOT/etc/apk" "$CROSS_ROOT/etc/ssl/certs"
-  cat <<REPOS | sudo tee "$CROSS_ROOT/etc/apk/repositories" >/dev/null
-https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main
-https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community
-REPOS
+  if [[ -f "$CROSS_COMPLETE" && -s "$repositories_file" ]]; then
+    for repository in "${managed_repositories[@]}"; do
+      sudo grep -Fqx "$repository" "$repositories_file" \
+        || printf '%s\n' "$repository" | sudo tee -a "$repositories_file" >/dev/null
+    done
+  else
+    printf '%s\n' "${managed_repositories[@]}" | sudo tee "$repositories_file" >/dev/null
+  fi
   sync_host_dns
   if [[ -f /etc/hosts ]]; then sudo cp -L -f /etc/hosts "$CROSS_ROOT/etc/hosts"; fi
   mount_bind /dev "$CROSS_ROOT/dev" 1
   mount_proc "$CROSS_ROOT/proc"
   mount_bind /sys "$CROSS_ROOT/sys" 1
-  [[ -d /run ]] && mount_bind /run "$CROSS_ROOT/run" 1 || true
+  sudo mount -o remount,bind,ro,nosuid,nodev,noexec "$CROSS_ROOT/sys" \
+    || warn "could not make Alpine /sys view read-only"
+  sudo mkdir -p "$CROSS_ROOT/run"
   ensure_chroot_exec
   ensure_file_backed_package_scripts
   bootstrap_apk_v2_runner
@@ -745,7 +863,11 @@ install_alpine_packages() {
     openssl-dev zlib-dev bzip2-dev xz-dev libffi-dev ncurses-dev readline-dev
     sqlite-dev libxml2-dev libxslt-dev libarchive-dev libssh2-dev libuv-dev
     rust cargo rustfmt rust-clippy rustup nodejs npm sudo su-exec dbus xdg-utils
+    openrc tzdata logrotate gnupg debian-archive-keyring
   )
+  # This is the supported Alpine branch migration path. The rollback snapshot
+  # restores the old rootfs if the package transaction or later validation fails.
+  apk_chroot upgrade --available --no-cache
   if [[ -f "$CROSS_COMPLETE" ]]; then
     apk_chroot add --no-cache "${required[@]}"
   else
@@ -815,8 +937,9 @@ PYTHON_DEBIAN_METADATA
 # get a real loader. Package checksums come from a freshly downloaded Debian
 # package index and are checked before extraction.
 install_glibc_runtime() {
-  local deb_arch multiarch loader releases_index latest_upstream
-  local packages_index package_dir index_chroot
+  local deb_arch multiarch loader
+  local packages_index package_dir index_chroot inrelease inrelease_chroot
+  local index_relative expected_index_sha actual_index_sha keyring
   local runtime_metadata gconv_metadata runtime_version gconv_version
   local runtime_filename gconv_filename runtime_sha256 gconv_sha256
   local runtime_deb gconv_deb actual glibc_report
@@ -835,35 +958,38 @@ install_glibc_runtime() {
     *) die "glibc runtime is unavailable for Alpine architecture: $ALPINE_ARCH" ;;
   esac
 
-  info "Resolving the latest stable GNU libc release for ${deb_arch}"
-  releases_index="$CROSS_CACHE/gnu-glibc-releases.html"
-  rm -f "$releases_index"
-  fetch "https://ftp.gnu.org/gnu/glibc/" "$releases_index"
-  latest_upstream="$(
-    { grep -oE 'glibc-[0-9]+\.[0-9]+\.tar\.xz' "$releases_index" || true; } \
-      | sed -E 's/^glibc-//; s/\.tar\.xz$//' \
-      | awk -F. '
-          $1 > major || ($1 == major && $2 > minor) {
-            major=$1; minor=$2
-          }
-          END {
-            if (major != "") print major "." minor
-          }
-        '
-  )"
-  [[ "$latest_upstream" =~ ^[0-9]+\.[0-9]+$ ]] \
-    || die "could not determine the latest stable GNU libc release"
-
+  info "Resolving the Debian experimental GNU libc runtime for ${deb_arch}"
+  inrelease="$CROSS_CACHE/debian-experimental-InRelease"
   packages_index="$CROSS_CACHE/debian-experimental-${deb_arch}-Packages.xz"
-  rm -f "$packages_index"
+  rm -f "$inrelease" "$packages_index"
+  fetch "https://deb.debian.org/debian/dists/experimental/InRelease" "$inrelease"
   fetch "https://deb.debian.org/debian/dists/experimental/main/binary-${deb_arch}/Packages.xz" \
     "$packages_index"
 
   package_dir="$CROSS_ROOT/tmp/cross-glibc-packages"
   index_chroot="/tmp/cross-glibc-packages/Packages.xz"
+  inrelease_chroot="/tmp/cross-glibc-packages/InRelease"
+  index_relative="main/binary-${deb_arch}/Packages.xz"
   sudo rm -rf "$package_dir"
   sudo mkdir -p "$package_dir"
   sudo cp -f "$packages_index" "$CROSS_ROOT$index_chroot"
+  sudo cp -f "$inrelease" "$CROSS_ROOT$inrelease_chroot"
+
+  keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+  [[ -f "$CROSS_ROOT$keyring" ]] || die "Debian archive keyring is unavailable"
+  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/bin/gpgv \
+    --keyring "$keyring" "$inrelease_chroot" >/dev/null \
+    || die "Debian experimental InRelease signature verification failed"
+  expected_index_sha="$(awk -v wanted="$index_relative" '
+    $1 == "SHA256:" { section=1; next }
+    section && /^[A-Z][A-Za-z0-9-]*:/ { section=0 }
+    section && $3 == wanted { print $1; exit }
+  ' "$inrelease")"
+  [[ "$expected_index_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "signed Debian InRelease does not describe $index_relative"
+  actual_index_sha="$(sha256_file "$packages_index")"
+  [[ "${actual_index_sha,,}" == "${expected_index_sha,,}" ]] \
+    || die "Debian Packages.xz does not match signed InRelease"
 
   runtime_metadata="$(read_debian_package_metadata \
     "$index_chroot" libc6 "$deb_arch")"
@@ -881,10 +1007,7 @@ install_glibc_runtime() {
   GLIBC_VERSION="${GLIBC_VERSION%%-*}"
   [[ "$GLIBC_VERSION" =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]] \
     || die "unexpected Debian glibc version: $GLIBC_DEBIAN_VERSION"
-  [[ "$GLIBC_VERSION" == "$latest_upstream" ]] \
-    || die "latest stable glibc is ${latest_upstream}, but Debian experimental provides ${GLIBC_DEBIAN_VERSION}"
-
-  info "Installing GNU libc ${GLIBC_VERSION} (${GLIBC_DEBIAN_VERSION}) for ${deb_arch}"
+  info "Installing limited GNU libc runtime ${GLIBC_VERSION} (${GLIBC_DEBIAN_VERSION}) for ${deb_arch}"
   runtime_deb="$CROSS_CACHE/${runtime_filename##*/}"
   gconv_deb="$CROSS_CACHE/${gconv_filename##*/}"
   fetch "https://deb.debian.org/debian/${runtime_filename}" "$runtime_deb"
@@ -956,6 +1079,28 @@ install_glibc_runtime() {
     || die "GNU libc ${GLIBC_VERSION} does not export __res_init"
 }
 
+configure_base_runtime() {
+  info "Configuring locale, timezone, and OpenRC compatibility"
+  if [[ -e /etc/localtime ]]; then
+    sudo cp -L -f -- /etc/localtime "$CROSS_ROOT/etc/localtime"
+    sudo chown root:root "$CROSS_ROOT/etc/localtime"
+    sudo chmod 0644 "$CROSS_ROOT/etc/localtime"
+  fi
+  if [[ -r /etc/timezone ]]; then
+    sudo cp -L -f -- /etc/timezone "$CROSS_ROOT/etc/timezone"
+    sudo chown root:root "$CROSS_ROOT/etc/timezone"
+    sudo chmod 0644 "$CROSS_ROOT/etc/timezone"
+  fi
+  sudo mkdir -p "$CROSS_ROOT/etc/profile.d"
+  cat <<'PROFILE' | sudo tee "$CROSS_ROOT/etc/profile.d/cross-runtime.sh" >/dev/null
+# Cross deliberately defaults to a portable UTF-8 locale. Users may override it.
+: "${LANG:=C.UTF-8}"
+export LANG
+PROFILE
+  sudo chown root:root "$CROSS_ROOT/etc/profile.d/cross-runtime.sh"
+  sudo chmod 0644 "$CROSS_ROOT/etc/profile.d/cross-runtime.sh"
+}
+
 configure_chronos_user() {
   info "Configuring chronos identity inside Alpine"
   local uid gid group host_home shadow_tmp
@@ -971,6 +1116,7 @@ configure_chronos_user() {
       -D -u "$uid" -G "$group" -h "$host_home" -s /bin/bash chronos
   fi
   shadow_tmp="$(mktemp)"
+  # shellcheck disable=SC2024 # sudo is needed for the input; output is a user-owned temporary file.
   sudo awk -F: 'BEGIN {OFS=FS} $1 == "chronos" {$2="x"} {print}' \
     "$CROSS_ROOT/etc/shadow" > "$shadow_tmp"
   sudo install -o root -g root -m 0600 "$shadow_tmp" "$CROSS_ROOT/etc/shadow"
@@ -1202,8 +1348,11 @@ export PATH="\$HOME/.local/bin:\$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sb
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
 export CROSS_SESSION=1
-export LANG=C.UTF-8
-export LC_ALL=
+export LANG="\${LANG:-C.UTF-8}"
+: "\${LC_ALL:=}"
+export LC_ALL
+: "\${TZ:=}"
+export TZ
 : "\${TERM:=dumb}"
 export TERM
 umask 022
@@ -1333,6 +1482,7 @@ PermitTunnel no
 PermitUserRC no
 GatewayPorts no
 PermitTTY yes
+AcceptEnv LANG LC_* TZ HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
 UseDNS no
 PrintMotd no
 LoginGraceTime 15
@@ -1364,6 +1514,7 @@ Host cross-local
   PasswordAuthentication no
   KbdInteractiveAuthentication no
   PreferredAuthentications publickey
+  SendEnv LANG LC_* TZ HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
   ClearAllForwardings yes
   ConnectTimeout 5
   ConnectionAttempts 1
@@ -1397,10 +1548,27 @@ CONFIG="$PREFIX/etc/cross.conf"
 
 PID_FILE="$CROSS_ROOT/run/cross-sshd.pid"
 LOG_FILE="$CROSS_ROOT/var/log/cross-sshd.log"
+DNS_WATCH_PID="$PREFIX/run/dns-watch.pid"
+OP_LOCK="$PREFIX/run/operation.lock"
 COMMAND_NAME="${CROSS_COMMAND_NAME:-cross-service}"
 info() { printf '%s: %s\n' "$COMMAND_NAME" "$*"; }
 warn() { printf '%s: WARN: %s\n' "$COMMAND_NAME" "$*" >&2; }
 die()  { printf '%s: ERROR: %s\n' "$COMMAND_NAME" "$*" >&2; exit 1; }
+
+acquire_operation_lock() {
+  local owner=""
+  if ! mkdir "$OP_LOCK" 2>/dev/null; then
+    [[ -r "$OP_LOCK/pid" ]] && read -r owner < "$OP_LOCK/pid" || true
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf -- "$OP_LOCK"
+      mkdir "$OP_LOCK" || die "cannot acquire operation lock"
+    else
+      die "another Cross operation is active${owner:+ (pid $owner)}"
+    fi
+  fi
+  printf '%s\n' "$$" > "$OP_LOCK/pid"
+  trap 'rm -rf -- "$OP_LOCK"' EXIT
+}
 
 is_mounted() {
   awk -v target="$1" '$2 == target {found=1} END {exit !found}' /proc/mounts
@@ -1444,6 +1612,8 @@ mount_file_bind() {
 
     sudo mount --bind "$source" "$target" \
       || die "failed to bind-mount $source to $target"
+    sudo mount -o remount,bind,ro,nosuid,nodev,noexec "$target" \
+      || die "failed to harden bind-mounted socket $target"
   fi
 
   [[ -S "$target" ]] \
@@ -1606,6 +1776,9 @@ sync_runtime_dns() {
     ' "$candidate"; then source="$candidate"; break; fi
   done
   [[ -n "$source" ]] || die "ChromeOS DNS unavailable"
+  if sudo cmp -s -- "$source" "$target" 2>/dev/null; then
+    return 0
+  fi
   sudo mkdir -p "$CROSS_ROOT/etc"
   temp="$(sudo mktemp "$CROSS_ROOT/etc/.resolv.conf.cross.XXXXXXXX")"
   if ! sudo cp -L -- "$source" "$temp"; then
@@ -1618,15 +1791,45 @@ sync_runtime_dns() {
   info "DNS synchronized from $source"
 }
 
+start_dns_watch() {
+  local pid=""
+  if [[ -r "$DNS_WATCH_PID" ]]; then
+    read -r pid < "$DNS_WATCH_PID" || true
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 0
+  fi
+  (
+    trap 'exit 0' TERM INT
+    while :; do
+      sync_runtime_dns >/dev/null 2>&1 || true
+      sleep 5 & wait $!
+    done
+  ) </dev/null >>"$PREFIX/log/dns-watch.log" 2>&1 &
+  printf '%s\n' "$!" > "$DNS_WATCH_PID"
+}
+
+stop_dns_watch() {
+  local pid=""
+  if [[ -r "$DNS_WATCH_PID" ]]; then
+    read -r pid < "$DNS_WATCH_PID" || true
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill -TERM "$pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$DNS_WATCH_PID"
+}
+
 prepare_mounts() {
   sync_runtime_dns
   if [[ -f /etc/hosts ]]; then sudo cp -L -f /etc/hosts "$CROSS_ROOT/etc/hosts"; fi
   mount_bind /dev "$CROSS_ROOT/dev" 1
   mount_proc "$CROSS_ROOT/proc"
   mount_bind /sys "$CROSS_ROOT/sys" 1
+  sudo mount -o remount,bind,ro,nosuid,nodev,noexec "$CROSS_ROOT/sys" \
+    || warn "could not make Alpine /sys view read-only"
   mount_home_executable
   mount_bind "$CROSS_WORK" "$CROSS_ROOT$CROSS_WORK" 0
-  sudo mkdir -p "$CROSS_ROOT/var/log" "$CROSS_ROOT/run/sshd"
+  sudo mkdir -p "$CROSS_ROOT/var/log" "$CROSS_ROOT/run/sshd" "$CROSS_ROOT/run/openrc"
+  sudo touch "$CROSS_ROOT/run/openrc/softlevel"
   [[ -S /run/dbus/system_bus_socket ]] \
     || die "ChromeOS system D-Bus socket is unavailable"
   mount_file_bind /run/dbus/system_bus_socket \
@@ -1646,6 +1849,8 @@ master_pid() {
   read -r pid < "$PID_FILE" || return 1
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   sudo kill -0 "$pid" >/dev/null 2>&1 || return 1
+  [[ "$(sudo cat "/proc/$pid/comm" 2>/dev/null || true)" == sshd ]] || return 1
+  [[ "$(sudo readlink "/proc/$pid/root" 2>/dev/null || true)" == "$CROSS_ROOT" ]] || return 1
   printf '%s\n' "$pid"
 }
 
@@ -1717,9 +1922,18 @@ start_service() {
   fi
   sudo rm -f "$PID_FILE"
   prepare_mounts
-  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd -t -f /etc/ssh/sshd_config_cross
-  sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd \
-    -f /etc/ssh/sshd_config_cross -E /var/log/cross-sshd.log
+  start_dns_watch
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd -t -f /etc/ssh/sshd_config_cross; then
+    stop_dns_watch
+    unmount_runtime
+    die "sshd configuration validation failed"
+  fi
+  if ! sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/sshd \
+      -f /etc/ssh/sshd_config_cross -E /var/log/cross-sshd.log; then
+    stop_dns_watch
+    unmount_runtime
+    die "sshd launch failed"
+  fi
   for ((i=1; i<=30; i++)); do
     if pid="$(master_pid 2>/dev/null)" && auth_probe; then
       info "started and authenticated (pid $pid, 127.0.0.1:$CROSS_SSH_PORT)"
@@ -1734,7 +1948,8 @@ start_service() {
 
 stop_service() {
   ensure_vt2_context
-  local pid pids
+  local pid pids i
+  stop_dns_watch
   if pid="$(master_pid 2>/dev/null)"; then
     sudo kill -TERM "$pid" >/dev/null 2>&1 || true
   fi
@@ -1742,8 +1957,11 @@ stop_service() {
   if [[ -n "$pids" ]]; then
     # shellcheck disable=SC2086
     sudo kill -TERM $pids >/dev/null 2>&1 || true
-    sleep 0.5
-    pids="$(chroot_pids || true)"
+    for ((i=1; i<=50; i++)); do
+      sleep 0.1
+      pids="$(chroot_pids || true)"
+      [[ -n "$pids" ]] || break
+    done
     if [[ -n "$pids" ]]; then
       # shellcheck disable=SC2086
       sudo kill -KILL $pids >/dev/null 2>&1 || true
@@ -1767,6 +1985,20 @@ status_service() {
 doctor_service() {
   ensure_vt2_context
   local client_blob auth_blob mode owner opts
+  printf 'Host kernel: %s\n' "$(uname -srmo)"
+  printf 'ChromeOS release: '
+  awk -F= '$1 == "CHROMEOS_RELEASE_VERSION" {gsub(/"/, "", $2); print $2; found=1} END {if (!found) print "unknown"}' /etc/lsb-release
+  printf 'Alpine release: '
+  sudo cat "$CROSS_ROOT/etc/alpine-release" 2>/dev/null || echo missing
+  printf 'Storage: '
+  sudo du -sh "$PREFIX" 2>/dev/null | awk '{print $1}' || echo unknown
+  df -h "$PREFIX" | tail -n 1
+  printf 'Boot job: '
+  if [[ -f /etc/init/cross-service.conf ]]; then echo installed; else echo unavailable; fi
+  printf 'D-Bus bridge: '
+  if [[ -S "$CROSS_ROOT/run/dbus/system_bus_socket" ]]; then echo mounted; else echo unavailable; fi
+  printf 'DNS: '
+  if sudo test -s "$CROSS_ROOT/etc/resolv.conf"; then echo configured; else echo missing; fi
   printf 'Service: '; status_service || true
   opts="$(mount_options "$CROSS_ROOT$HOST_HOME")"
   printf 'HOME bind options: %s\n' "${opts:-not mounted}"
@@ -1812,14 +2044,158 @@ doctor_service() {
   fi
 }
 
+disk_service() {
+  printf 'Cross storage:\n'
+  sudo du -sh "$PREFIX" 2>/dev/null || true
+  printf 'Filesystem:\n'
+  df -h "$PREFIX"
+  printf 'Cache: '
+  du -sh "$PREFIX/cache" 2>/dev/null | awk '{print $1}' || echo unknown
+}
+
+service_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else
+    die "sha256sum or openssl is required"
+  fi
+}
+
+prune_service() {
+  ensure_vt2_context
+  find "$PREFIX/cache" -maxdepth 1 -type f -mtime +14 -delete
+  sudo find "$PREFIX/log" "$CROSS_ROOT/var/log" -maxdepth 1 -type f \
+    -size +10M -exec sh -c 'for f do tail -c 5242880 "$f" > "$f.tmp" && cat "$f.tmp" > "$f" && rm -f "$f.tmp"; done' sh {} +
+  info "old download cache entries removed and large logs capped"
+}
+
+backup_service() {
+  ensure_vt2_context
+  local output="${1:-}" was_running=0 digest
+  [[ "$output" == /* ]] || die "usage: $COMMAND_NAME backup /absolute/path.tar.gz"
+  case "$output" in "$PREFIX"|"$PREFIX"/*) die "backup must be stored outside $PREFIX" ;; esac
+  [[ ! -e "$output" ]] || die "refusing to overwrite existing backup: $output"
+  [[ ! -e "$output.sha256" ]] || die "refusing to overwrite existing digest: $output.sha256"
+  master_pid >/dev/null 2>&1 && was_running=1
+  stop_service
+  if ! sudo tar -czf "$output" -C "$PREFIX" .; then
+    (( was_running == 0 )) || start_service || true
+    die "backup creation failed"
+  fi
+  sudo chown "$HOST_UID:$HOST_GID" "$output"
+  chmod 0600 "$output"
+  digest="$(service_sha256 "$output")"
+  printf '%s  %s\n' "$digest" "${output##*/}" > "$output.sha256"
+  chmod 0600 "$output.sha256"
+  (( was_running == 0 )) || start_service
+  info "backup created: $output (contains the private localhost SSH key)"
+}
+
+restore_service() {
+  ensure_vt2_context
+  local archive="${1:-}" parent stage previous failed list expected actual
+  [[ "$archive" == /* && -r "$archive" ]] \
+    || die "usage: $COMMAND_NAME restore /absolute/path.tar.gz"
+  [[ -r "$archive.sha256" ]] || die "backup digest is missing: $archive.sha256"
+  expected="$(awk 'NF {print $1; exit}' "$archive.sha256")"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "backup digest is invalid"
+  actual="$(service_sha256 "$archive")"
+  [[ "${actual,,}" == "${expected,,}" ]] || die "backup SHA-256 verification failed"
+  list="$(mktemp "$PREFIX/run/restore-list.XXXXXXXX")"
+  if ! sudo tar -tzf "$archive" > "$list"; then
+    rm -f -- "$list"
+    die "backup archive is unreadable"
+  fi
+  if awk '
+      /^\// || /(^|\/)\.\.($|\/)/ { bad=1 }
+      END { exit bad ? 0 : 1 }
+    ' "$list"; then
+    rm -f -- "$list"
+    die "backup contains an unsafe path"
+  fi
+  rm -f -- "$list"
+  parent="$(dirname -- "$PREFIX")"
+  stage="$parent/.cross-restore-$$"
+  previous="$PREFIX.replaced-$(date +%Y%m%d-%H%M%S)"
+  [[ ! -e "$stage" && ! -e "$previous" ]] || die "restore staging path already exists"
+  stop_service
+  sudo mkdir -m 0700 "$stage"
+  if ! sudo tar -xzf "$archive" -C "$stage" \
+      || ! sudo test -f "$stage/.alpine-cross-managed" \
+      || ! sudo test -f "$stage/alpine/etc/alpine-release" \
+      || ! sudo test -f "$stage/etc/cross.conf"; then
+    sudo rm -rf -- "$stage"
+    die "backup validation failed"
+  fi
+  sudo mv -- "$PREFIX" "$previous"
+  if ! sudo mv -- "$stage" "$PREFIX"; then
+    sudo mv -- "$previous" "$PREFIX" || true
+    die "restore switch failed"
+  fi
+  info "backup restored; previous installation retained at $previous"
+  rm -rf -- "$OP_LOCK"
+  trap - EXIT
+  if ! "$PREFIX/bin/cross-service" start; then
+    failed="$PREFIX.failed-restore-$(date +%Y%m%d-%H%M%S)"
+    warn "restored installation did not start; reverting to the previous installation"
+    sudo mv -- "$PREFIX" "$failed"
+    sudo mv -- "$previous" "$PREFIX"
+    rm -rf -- "$PREFIX/run/operation.lock"
+    "$PREFIX/bin/cross-service" start >/dev/null 2>&1 || true
+    die "restore validation failed; failed tree retained at $failed"
+  fi
+}
+
+remove_profile_block() {
+  local file="$1" tmp
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "${file}.cross.XXXXXXXX")"
+  awk '
+    $0 == "# >>> cross-alpine >>>" { skip=1; next }
+    $0 == "# <<< cross-alpine <<<" { skip=0; next }
+    !skip { print }
+  ' "$file" > "$tmp"
+  chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$file"
+}
+
+uninstall_service() {
+  ensure_vt2_context
+  [[ "${1:-}" == --yes ]] \
+    || die "uninstall is destructive; rerun: $COMMAND_NAME uninstall --yes"
+  local retired="$PREFIX.uninstalled-$(date +%Y%m%d-%H%M%S)"
+  [[ ! -e "$retired" ]] || die "uninstall destination already exists: $retired"
+  stop_service
+  if [[ -e /etc/init/cross-service.conf ]] \
+      && sudo grep -Fqx '# Cross Alpine SSH service. Generated by cross.sh.' /etc/init/cross-service.conf; then
+    sudo rm -f /etc/init/cross-service.conf
+    sudo initctl reload-configuration >/dev/null 2>&1 || true
+  fi
+  remove_profile_block "$HOST_HOME/.bashrc"
+  remove_profile_block "$HOST_HOME/.bash_profile"
+  rm -rf -- "$OP_LOCK"
+  trap - EXIT
+  sudo mv -- "$PREFIX" "$retired"
+  printf '%s\n' "Cross was disabled and moved to $retired"
+  printf '%s\n' "Delete that directory only after confirming the backup you need."
+  printf '%s\n' "If verified boot was disabled by an older Cross release, use ChromeOS recovery to restore the verified system image."
+}
+
 case "${1:-status}" in
-  start) start_service ;;
-  stop) stop_service ;;
-  restart) stop_service; start_service ;;
+  start) acquire_operation_lock; start_service ;;
+  stop) acquire_operation_lock; stop_service ;;
+  restart) acquire_operation_lock; stop_service; start_service ;;
   status) status_service ;;
   doctor) doctor_service ;;
   log) sudo tail -n "${2:-80}" "$LOG_FILE" ;;
-  *) die "usage: $COMMAND_NAME {start|stop|restart|status|doctor|log [lines]}" ;;
+  disk) disk_service ;;
+  prune) acquire_operation_lock; prune_service ;;
+  backup) acquire_operation_lock; shift; backup_service "$@" ;;
+  restore) acquire_operation_lock; shift; restore_service "$@" ;;
+  uninstall) acquire_operation_lock; shift; uninstall_service "$@" ;;
+  *) die "usage: $COMMAND_NAME {start|stop|restart|status|doctor|log [lines]|disk|prune|backup FILE|restore FILE|uninstall --yes}" ;;
 esac
 SERVICE
   chmod 0755 "$CROSS_BIN/cross-service"
@@ -1840,7 +2216,7 @@ SSH_CONFIG="$PREFIX/etc/ssh/config"
 # bypasses this dispatch, so an Alpine command with the same name remains
 # reachable (for example, `cross -- start`).
 case "${1:-}" in
-  start|stop|restart|status|doctor|log)
+  start|stop|restart|status|doctor|log|disk|prune|backup|restore|uninstall)
     service_command="$1"
     shift
     export CROSS_COMMAND_NAME=cross
@@ -1984,14 +2360,9 @@ NVM_NOTICE
   chmod 0755 "$CROSS_BIN/nvm"
 }
 
-# ChromeOS release images intentionally do not load services from the writable
-# /usr/local tree. A persistent boot service therefore needs a job in /etc/init,
-# which in turn requires rootfs verification to have been disabled. Autostart is
-# optional: inability to configure it must not prevent the Alpine setup.
+# Cross never changes verified-boot settings. A persistent Upstart job is used
+# only when an administrator-managed image already exposes writable /etc/init.
 ensure_boot_autostart_prerequisites() {
-  local make_dev_ssd="/usr/share/vboot/bin/make_dev_ssd.sh"
-  local root_device="" root_partition="" kernel_partition=""
-
   info "Checking ChromeOS boot autostart prerequisites"
   BOOT_AUTOSTART_AVAILABLE=0
   if ! have initctl; then
@@ -2004,68 +2375,11 @@ ensure_boot_autostart_prerequisites() {
     return 0
   fi
 
-  # A developer/test image can have verity disabled while / is currently
-  # mounted read-only. Prefer a remount over rewriting its kernel configuration.
-  if sudo mount -o remount,rw / 2>/dev/null \
-      && sudo test -d /etc/init && sudo test -w /etc/init; then
-    info "Remounted the already-unverified ChromeOS rootfs read-write"
-    BOOT_AUTOSTART_AVAILABLE=1
-    return 0
-  fi
-
-  if [[ ! -x "$make_dev_ssd" ]]; then
-    warn "Boot autostart unavailable: /etc/init is read-only and $make_dev_ssd was not found."
-    warn "Continuing setup without boot autostart."
-    return 0
-  fi
-  if ! have rootdev; then
-    warn "Boot autostart unavailable: rootdev was not found."
-    warn "Continuing setup without boot autostart."
-    return 0
-  fi
-  root_device="$(rootdev -s 2>/dev/null || true)"
-  if [[ "$root_device" =~ ([0-9]+)$ ]]; then
-    root_partition="${BASH_REMATCH[1]}"
-  fi
-  if [[ ! "$root_partition" =~ ^[0-9]+$ ]] || (( root_partition <= 1 )); then
-    warn "Boot autostart unavailable: cannot identify the active ChromeOS root partition (${root_device:-unknown})."
-    warn "Continuing setup without boot autostart."
-    return 0
-  fi
-  kernel_partition="$((root_partition - 1))"
-  case "$kernel_partition" in
-    2|4|6) ;;
-    *)
-      warn "Boot autostart unavailable: unexpected active ChromeOS kernel partition $kernel_partition."
-      warn "Continuing setup without boot autostart."
-      return 0
-      ;;
-  esac
-
-  warn "Boot autostart requires disabling ChromeOS rootfs verification."
-  warn "This weakens verified boot and can affect ChromeOS updates."
-  info "Disabling rootfs verification for active kernel partition $kernel_partition"
-  if ! sudo "$make_dev_ssd" --remove_rootfs_verification \
-      --partitions "$kernel_partition"; then
-    warn "Boot autostart unavailable: could not disable rootfs verification."
-    warn "Continuing setup without boot autostart; follow make_dev_ssd.sh's guidance to enable it later."
-    return 0
-  fi
-
-  cat <<'REBOOT_REQUIRED'
-
-ChromeOS must reboot before /etc/init becomes writable, but Cross setup will
-continue now without boot autostart.
-
-After this setup completes:
-
-  1. Reboot the Chromebook when convenient.
-  2. Return to VT-2 as chronos.
-  3. Run cross.sh again to install boot autostart.
-
-Do not switch Developer Mode off; doing so may wipe local data.
-REBOOT_REQUIRED
-  warn "Continuing setup without boot autostart until the post-reboot rerun."
+  # Cross must never weaken verified boot as a side effect of installing a
+  # development environment. Autostart is enabled only on images where the
+  # administrator has already made /etc/init writable for another reason.
+  warn "Boot autostart unavailable: /etc/init is read-only."
+  warn "Cross will not disable ChromeOS rootfs verification; use manual startup after boot."
   return 0
 }
 
@@ -2185,7 +2499,9 @@ write_profile() {
   local end='# <<< cross-alpine <<<'
   local tmp
   touch "$bashrc" "$profile"
-  tmp="$(mktemp)"
+  [[ -e "$bashrc.cross-before-first-install" ]] || cp -p -- "$bashrc" "$bashrc.cross-before-first-install"
+  [[ -e "$profile.cross-before-first-install" ]] || cp -p -- "$profile" "$profile.cross-before-first-install"
+  tmp="$(mktemp "${bashrc}.cross.XXXXXXXX")"
   awk -v begin="$begin" -v end="$end" '
     $0 == begin {skip=1; next}
     $0 == end {skip=0; next}
@@ -2193,6 +2509,7 @@ write_profile() {
   ' "$bashrc" > "$tmp"
   {
     printf '\n# >>> cross-alpine >>>\n'
+    printf 'export CROSS_PREFIX=%q\n' "$CROSS_PREFIX"
     printf 'export CROSS_WORK=%q\n' "$CROSS_WORK/chronos"
     cat <<'PROFILE'
 if [ -n "${CROSS_SESSION:-}" ]; then
@@ -2202,22 +2519,27 @@ if [ -n "${CROSS_SESSION:-}" ]; then
       ;;
   esac
 else
-  export PATH="/usr/local/cross/bin:$PATH"
+  export PATH="$CROSS_PREFIX/bin:$PATH"
 fi
 # <<< cross-alpine <<<
 PROFILE
   } >> "$tmp"
-  cat "$tmp" > "$bashrc"
-  rm -f "$tmp"
+  chmod --reference="$bashrc" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$bashrc"
 
   if ! grep -Fq "$begin" "$profile"; then
-    cat >> "$profile" <<'PROFILE'
+    tmp="$(mktemp "${profile}.cross.XXXXXXXX")"
+    cat "$profile" > "$tmp"
+    cat >> "$tmp" <<'PROFILE'
 
 # >>> cross-alpine >>>
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
 # <<< cross-alpine <<<
 PROFILE
+    chmod --reference="$profile" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+    mv -f -- "$tmp" "$profile"
   fi
+  PROFILE_CHANGED=1
 }
 
 validate_dns() {
@@ -2256,9 +2578,11 @@ validate() {
   [[ -x "$CROSS_BIN/xdg-open" ]] || die "xdg-open host wrapper is missing"
   "$CROSS_BIN/cross" /bin/sh -c '
     test -x /sbin/apk.static
-    for cli in git curl nano vim ffmpeg gcc make abuild rustup rustc cargo node npm npx xdg-open dbus-send; do
+    for cli in git curl nano vim ffmpeg gcc make abuild rustup rustc cargo node npm npx xdg-open dbus-send openrc rc-service gpgv; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
+    test -f /usr/share/keyrings/debian-archive-keyring.gpg
+    test -f /run/openrc/softlevel
     test "$(command -v xdg-open)" = /usr/local/bin/xdg-open || exit 1
     test -x /usr/bin/xdg-open || exit 1
     xdg-open --help >/dev/null || exit 1
@@ -2323,12 +2647,16 @@ main() {
   enable_logging
   SETUP_STARTED=1
   preflight
+  acquire_setup_lock
+  [[ ! -f "$CROSS_COMPLETE" ]] || HAD_COMPLETE_INSTALL=1
   ensure_boot_autostart_prerequisites
   reset_or_prepare_prefix
   quiesce_existing_service
+  begin_transaction
   download_and_extract_rootfs
   configure_rootfs
   install_alpine_packages
+  configure_base_runtime
   remove_legacy_gui_components
   install_glibc_runtime
   configure_chronos_user
@@ -2354,14 +2682,15 @@ main() {
   printf '%s\n' "$SCRIPT_VERSION" | sudo tee "$CROSS_COMPLETE" >/dev/null
   sudo chown root:root "$CROSS_COMPLETE"
   sudo chmod 0644 "$CROSS_COMPLETE"
+  commit_transaction
 
   info "Setup complete"
   cat <<SUMMARY
 
 No third-party source packages were built. System tools and musl libraries came
-from Alpine ${ALPINE_BRANCH}; the latest Debian experimental packages resolved
-at setup time (${GLIBC_DEBIAN_VERSION}) provide GNU libc ${GLIBC_VERSION}
-alongside musl for glibc-linked binaries such as npm's workerd.
+from Alpine ${ALPINE_BRANCH}. Signed Debian experimental metadata resolved
+${GLIBC_DEBIAN_VERSION}, providing a limited GNU libc ${GLIBC_VERSION} runtime
+aid alongside musl. This does not guarantee arbitrary glibc binary compatibility.
 Transactions use Alpine apk-tools v2 static from ${APK_COMPAT_BRANCH} because
 the current ChromeOS kernel rejects apk v3 memfd hooks.
 
@@ -2385,6 +2714,10 @@ Service management from VT-2:
   cross stop
   cross restart
   cross doctor
+  cross disk
+  cross backup /absolute/path.tar.gz
+  cross restore /absolute/path.tar.gz
+  cross uninstall --yes
 
 Examples:
   cross
@@ -2398,6 +2731,7 @@ ChromeOS HOME is bind-mounted at the same pathname inside Alpine. The *bind
 mount* is set to exec,nosuid,nodev; ChromeOS' original HOME mount flags stay
 unchanged. This is a security trade-off: because no mount namespace is used,
 programs on the host can also reach the executable alias under the chroot.
+Root inside Cross may have host-root-equivalent impact; Cross is not a sandbox.
 
 ELF and symlink execution from HOME are tested independently of any tool.
 You can keep Cargo build outputs, rustup toolchains, and npm/npx caches under

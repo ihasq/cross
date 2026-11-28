@@ -119,10 +119,12 @@ cross sudo apk add <package>
 cross sudo apk upgrade
 ```
 
-Cross uses an apk-tools v2 static compatibility runner because affected
-ChromeOS kernels reject apk-tools v3 package-script execution. This cross-
-branch compatibility mechanism is covered by the release support matrix; it is
-not an upstream Alpine guarantee.
+Cross copies an apk-tools v2 static compatibility runner to the package-manager-
+independent path `/usr/local/libexec/cross-apk2`, because affected ChromeOS
+kernels reject apk-tools v3 package-script execution. The temporary
+`apk-tools-static` package is removed before normal upgrades, so apk v3 cannot
+replace the compatibility runner. This cross-branch mechanism is covered by the
+release support matrix; it is not an upstream Alpine guarantee.
 
 ### OpenRC services
 

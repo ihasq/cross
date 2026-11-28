@@ -19,6 +19,7 @@ jobs:
         run: |
           sha256sum cross.sh > SHA256SUMS
           bash tests/static.sh
+          bash tests/rollback-transaction.sh
           shellcheck -S error -x cross.sh tests/*.sh scripts/*.sh
       - name: Attest installer provenance
         uses: actions/attest-build-provenance@v3

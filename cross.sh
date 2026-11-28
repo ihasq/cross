@@ -18,7 +18,7 @@
 set -Eeuo pipefail
 umask 022
 
-SCRIPT_VERSION="2026-11-28.74-lifecycle-hardening"
+SCRIPT_VERSION="2026-11-28.75-apk2-runner-fix"
 ALPINE_VERSION="3.24.4"
 ALPINE_BRANCH="v3.24"
 APK_COMPAT_BRANCH="v3.22"
@@ -38,6 +38,8 @@ CROSS_WORK="$CROSS_PREFIX/work"
 CROSS_SSH_PORT="${CROSS_SSH_PORT:-32222}"
 CROSS_MARKER="$CROSS_PREFIX/.alpine-cross-managed"
 CROSS_COMPLETE="$CROSS_PREFIX/.alpine-cross-complete"
+APK_COMPAT_CHROOT="/usr/local/libexec/cross-apk2"
+APK_COMPAT_BIN="$CROSS_ROOT$APK_COMPAT_CHROOT"
 LOG_FILE="${HOME:-/home/chronos/user}/cross-setup-$(date +%Y%m%d-%H%M%S).log"
 
 HOST_ARCH=""
@@ -174,6 +176,7 @@ acquire_setup_lock() {
 }
 
 begin_transaction() {
+  [[ -f "$CROSS_COMPLETE" ]] || return 0
   rootfs_is_resumable || return 0
   local used_kib free_kib
   used_kib="$(sudo du -sk "$CROSS_ROOT" | awk '{print $1}')"
@@ -182,7 +185,7 @@ begin_transaction() {
     || die "cannot determine space required for rollback snapshot"
   (( free_kib > used_kib + 524288 )) \
     || die "insufficient free space for rollback snapshot; run cross prune or move a backup"
-  TRANSACTION_DIR="$CROSS_PREFIX/.rollback-$(date +%Y%m%d-%H%M%S)-$$"
+  TRANSACTION_DIR="${CROSS_PREFIX}.rollback-$(date +%Y%m%d-%H%M%S)-$$"
   info "Creating pre-update rollback snapshot"
   sudo mkdir -p "$TRANSACTION_DIR"
   sudo chmod 0700 "$TRANSACTION_DIR"
@@ -193,29 +196,44 @@ begin_transaction() {
     sudo cp -a -- "$path" "$TRANSACTION_DIR/$name"
   done
   [[ ! -e "$CROSS_COMPLETE" ]] || sudo cp -a -- "$CROSS_COMPLETE" "$TRANSACTION_DIR/complete"
+  if ! sudo test -d "$TRANSACTION_DIR/alpine" \
+      || ! sudo test -d "$TRANSACTION_DIR/bin" \
+      || ! sudo test -d "$TRANSACTION_DIR/etc" \
+      || ! sudo test -f "$TRANSACTION_DIR/complete"; then
+    sudo rm -rf -- "$TRANSACTION_DIR"
+    die "rollback snapshot validation failed before update"
+  fi
   TRANSACTION_ACTIVE=1
 }
 
 rollback_transaction() {
   (( TRANSACTION_ACTIVE )) || return 0
+  local failed_dir path name
   warn "Setup failed; restoring the pre-update Cross snapshot"
   release_setup_mounts
-  if [[ ! -d "$TRANSACTION_DIR/alpine" || ! -d "$TRANSACTION_DIR/bin" || ! -d "$TRANSACTION_DIR/etc" ]]; then
+  if ! sudo test -d "$TRANSACTION_DIR/alpine" \
+      || ! sudo test -d "$TRANSACTION_DIR/bin" \
+      || ! sudo test -d "$TRANSACTION_DIR/etc" \
+      || ! sudo test -f "$TRANSACTION_DIR/complete"; then
     warn "rollback snapshot is incomplete; preserving the failed tree and snapshot for manual recovery"
     TRANSACTION_ACTIVE=0
     return 1
   fi
-  sudo rm -rf -- "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_ETC"
-  [[ ! -e "$TRANSACTION_DIR/alpine" ]] || sudo cp -a -- "$TRANSACTION_DIR/alpine" "$CROSS_ROOT"
-  [[ ! -e "$TRANSACTION_DIR/bin" ]] || sudo cp -a -- "$TRANSACTION_DIR/bin" "$CROSS_BIN"
-  [[ ! -e "$TRANSACTION_DIR/etc" ]] || sudo cp -a -- "$TRANSACTION_DIR/etc" "$CROSS_ETC"
-  if [[ -e "$TRANSACTION_DIR/complete" ]]; then
-    sudo cp -a -- "$TRANSACTION_DIR/complete" "$CROSS_COMPLETE"
-  else
-    sudo rm -f -- "$CROSS_COMPLETE"
-  fi
+  failed_dir="${CROSS_PREFIX}.failed-update-$(date +%Y%m%d-%H%M%S)-$$"
+  sudo mkdir -m 0700 "$failed_dir"
+  for path in "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_ETC"; do
+    [[ -e "$path" ]] || continue
+    name="${path##*/}"
+    sudo mv -- "$path" "$failed_dir/$name"
+  done
+  [[ ! -e "$CROSS_COMPLETE" ]] || sudo mv -- "$CROSS_COMPLETE" "$failed_dir/complete"
+  sudo mv -- "$TRANSACTION_DIR/alpine" "$CROSS_ROOT"
+  sudo mv -- "$TRANSACTION_DIR/bin" "$CROSS_BIN"
+  sudo mv -- "$TRANSACTION_DIR/etc" "$CROSS_ETC"
+  sudo mv -- "$TRANSACTION_DIR/complete" "$CROSS_COMPLETE"
   sudo rm -rf -- "$TRANSACTION_DIR"
   TRANSACTION_ACTIVE=0
+  warn "failed update retained for inspection at $failed_dir"
   if (( SERVICE_WAS_RUNNING )) && [[ -x "$CROSS_BIN/cross-service" ]]; then
     "$CROSS_BIN/cross-service" start >/dev/null 2>&1 || warn "old service could not be restarted automatically"
   fi
@@ -225,6 +243,35 @@ commit_transaction() {
   (( TRANSACTION_ACTIVE )) || return 0
   TRANSACTION_ACTIVE=0
   sudo rm -rf -- "$TRANSACTION_DIR" || warn "could not remove completed rollback snapshot: $TRANSACTION_DIR"
+}
+
+recover_legacy_rollback() {
+  local snapshot="" failed_dir path name
+  snapshot="$(sudo find "$CROSS_PREFIX" -mindepth 1 -maxdepth 1 -type d \
+    -name '.rollback-*' -print 2>/dev/null | sort | tail -n 1)"
+  [[ -n "$snapshot" ]] || return 0
+  if ! sudo test -d "$snapshot/alpine" \
+      || ! sudo test -d "$snapshot/bin" \
+      || ! sudo test -d "$snapshot/etc" \
+      || ! sudo test -f "$snapshot/complete"; then
+    warn "legacy rollback snapshot is incomplete and was left untouched: $snapshot"
+    return 0
+  fi
+  warn "Recovering the complete rollback snapshot left by a failed older setup"
+  failed_dir="${CROSS_PREFIX}.failed-legacy-update-$(date +%Y%m%d-%H%M%S)-$$"
+  sudo mkdir -m 0700 "$failed_dir"
+  for path in "$CROSS_ROOT" "$CROSS_BIN" "$CROSS_ETC"; do
+    [[ -e "$path" ]] || continue
+    name="${path##*/}"
+    sudo mv -- "$path" "$failed_dir/$name"
+  done
+  [[ ! -e "$CROSS_COMPLETE" ]] || sudo mv -- "$CROSS_COMPLETE" "$failed_dir/complete"
+  sudo mv -- "$snapshot/alpine" "$CROSS_ROOT"
+  sudo mv -- "$snapshot/bin" "$CROSS_BIN"
+  sudo mv -- "$snapshot/etc" "$CROSS_ETC"
+  sudo mv -- "$snapshot/complete" "$CROSS_COMPLETE"
+  sudo rmdir -- "$snapshot"
+  warn "Legacy rollback restored; failed update retained at $failed_dir"
 }
 
 remove_host_profile_blocks() {
@@ -396,27 +443,51 @@ ensure_file_backed_package_scripts() {
 bootstrap_apk_v2_runner() {
   local compat_repositories="$CROSS_ROOT/etc/apk/repositories.apk2"
   local version=""
-  if [[ -x "$CROSS_ROOT/sbin/apk.static" ]]; then
-    version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
+  if [[ -x "$APK_COMPAT_BIN" ]]; then
+    version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" "$APK_COMPAT_CHROOT" --version 2>&1 | sed -n '1p')"
   fi
   if [[ "$version" != apk-tools\ 2.* ]]; then
-    info "Installing Alpine apk-tools v2 compatibility runner"
-    cat <<REPOS | sudo tee "$compat_repositories" >/dev/null
+    if [[ -x "$CROSS_ROOT/sbin/apk.static" ]]; then
+      version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
+    fi
+    if [[ "$version" != apk-tools\ 2.* ]]; then
+      info "Installing Alpine apk-tools v2 compatibility runner"
+      cat <<REPOS | sudo tee "$compat_repositories" >/dev/null
 https://dl-cdn.alpinelinux.org/alpine/${APK_COMPAT_BRANCH}/main
 REPOS
-    sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
-      --progress \
-      --repositories-file /etc/apk/repositories.apk2 \
-      --scripts=no --commit-hooks=no add --no-cache apk-tools-static
-    [[ -x "$CROSS_ROOT/sbin/apk.static" ]] || die "Alpine apk-tools v2 binary not installed"
-    version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
+      if sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
+          info --exists apk-tools-static >/dev/null 2>&1; then
+        sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
+          --scripts=no --commit-hooks=no del apk-tools-static
+      fi
+      sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk \
+        --progress \
+        --repositories-file /etc/apk/repositories.apk2 \
+        --scripts=no --commit-hooks=no add --no-cache apk-tools-static
+      [[ -x "$CROSS_ROOT/sbin/apk.static" ]] || die "Alpine apk-tools v2 binary not installed"
+      version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --version 2>&1 | sed -n '1p')"
+    fi
+    [[ "$version" == apk-tools\ 2.* ]] || die "unexpected compatibility apk version: $version"
+    sudo mkdir -p "$(dirname -- "$APK_COMPAT_BIN")"
+    sudo cp -f -- "$CROSS_ROOT/sbin/apk.static" "$APK_COMPAT_BIN"
+    sudo chown root:root "$APK_COMPAT_BIN"
+    sudo chmod 0755 "$APK_COMPAT_BIN"
+    version="$(sudo "$CHROOT_BIN" "$CROSS_ROOT" "$APK_COMPAT_CHROOT" --version 2>&1 | sed -n '1p')"
   else
     info "Using existing Alpine apk-tools v2 compatibility runner"
   fi
   [[ "$version" == apk-tools\ 2.* ]] || die "unexpected compatibility apk version: $version"
+  # Never let the normal Alpine upgrade replace the v2 runner. It is copied to
+  # an unmanaged path first, then the temporary apk-tools-static package is
+  # removed from the installed package set.
+  if sudo "$CHROOT_BIN" "$CROSS_ROOT" "$APK_COMPAT_CHROOT" \
+      info --exists apk-tools-static >/dev/null 2>&1; then
+    sudo "$CHROOT_BIN" "$CROSS_ROOT" "$APK_COMPAT_CHROOT" \
+      --progress del apk-tools-static
+  fi
   printf 'Compatibility apk: %s\n' "$version"
   sudo mkdir -p "$CROSS_ROOT/usr/local/sbin"
-  sudo ln -sfn /sbin/apk.static "$CROSS_ROOT/usr/local/sbin/apk"
+  sudo ln -sfn "$APK_COMPAT_CHROOT" "$CROSS_ROOT/usr/local/sbin/apk"
 }
 
 ensure_chroot_exec() {
@@ -575,7 +646,8 @@ quiesce_existing_service() {
 rootfs_is_resumable() {
   [[ -f "$CROSS_ROOT/lib/apk/db/installed" ]] \
     && [[ -x "$CROSS_ROOT/bin/busybox" ]] \
-    && [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
+    && { [[ -x "$APK_COMPAT_BIN" ]] || [[ -x "$CROSS_ROOT/sbin/apk.static" ]] \
+      || [[ -x "$CROSS_ROOT/sbin/apk" ]]; } \
     && [[ -d "$CROSS_ROOT/etc/apk" ]]
 }
 
@@ -655,7 +727,7 @@ configure_rootfs() {
   bootstrap_apk_v2_runner
 }
 
-apk_chroot() { sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static --progress "$@"; }
+apk_chroot() { sudo "$CHROOT_BIN" "$CROSS_ROOT" "$APK_COMPAT_CHROOT" --progress "$@"; }
 
 format_download_size() {
   local bytes="$1"
@@ -873,6 +945,9 @@ install_alpine_packages() {
   else
     download_initial_packages "${required[@]}"
   fi
+  # Repair package scripts left failed by releases where apk-tools-static was
+  # accidentally upgraded to v3 before these packages were installed.
+  apk_chroot fix --no-cache pinentry openrc
   sudo "$CHROOT_BIN" "$CROSS_ROOT" /usr/sbin/update-ca-certificates || true
   sudo mkdir -p "$CROSS_ROOT/usr/local/bin"
   sudo ln -sfn /usr/bin/rustup-init "$CROSS_ROOT/usr/local/bin/rustup"
@@ -1155,8 +1230,7 @@ remove_legacy_gui_components() {
     mupdf-x11 font-dejavu
   )
   for package in "${legacy_packages[@]}"; do
-    if sudo "$CHROOT_BIN" "$CROSS_ROOT" /sbin/apk.static \
-        info -e "$package" >/dev/null 2>&1; then
+    if apk_chroot info -e "$package" >/dev/null 2>&1; then
       installed+=("$package")
     fi
   done
@@ -1359,7 +1433,7 @@ umask 022
 
 resolve_cross_tool() {
   case "\$1" in
-    apk)              printf '%s\n' /sbin/apk.static ;;
+    apk)              printf '%s\n' "$APK_COMPAT_CHROOT" ;;
     bash)             printf '%s\n' /bin/bash ;;
     sh)               printf '%s\n' /bin/sh ;;
     git)              printf '%s\n' /usr/bin/git ;;
@@ -2286,7 +2360,7 @@ CLIENT
 
   local spec cmd remote_path
   local wrapper_specs=(
-    'apk:/sbin/apk.static'
+    'apk:/usr/local/libexec/cross-apk2'
     'git:/usr/bin/git'
     'git-upload-pack:/usr/bin/git-upload-pack'
     'git-receive-pack:/usr/bin/git-receive-pack'
@@ -2577,7 +2651,7 @@ validate() {
   "$CROSS_BIN/cross" status
   [[ -x "$CROSS_BIN/xdg-open" ]] || die "xdg-open host wrapper is missing"
   "$CROSS_BIN/cross" /bin/sh -c '
-    test -x /sbin/apk.static
+    test -x /usr/local/libexec/cross-apk2
     for cli in git curl nano vim ffmpeg gcc make abuild rustup rustc cargo node npm npx xdg-open dbus-send openrc rc-service gpgv; do
       command -v "$cli" >/dev/null 2>&1 || exit 1
     done
@@ -2652,6 +2726,7 @@ main() {
   ensure_boot_autostart_prerequisites
   reset_or_prepare_prefix
   quiesce_existing_service
+  recover_legacy_rollback
   begin_transaction
   download_and_extract_rootfs
   configure_rootfs

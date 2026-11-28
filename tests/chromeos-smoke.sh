@@ -11,7 +11,7 @@ cross_bin="${CROSS_PREFIX:-/usr/local/cross}/bin/cross"
 "$cross_bin" doctor
 "$cross_bin" /bin/sh -eu -c '
   test "$CROSS_SESSION" = 1
-  test -x /sbin/apk.static
+  test -x /usr/local/libexec/cross-apk2
   test -f /usr/share/keyrings/debian-archive-keyring.gpg
   test -f /run/openrc/softlevel
   test -S /run/dbus/system_bus_socket

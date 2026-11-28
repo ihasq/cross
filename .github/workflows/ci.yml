@@ -13,6 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax and policy checks
-        run: bash tests/static.sh
+        run: |
+          bash tests/static.sh
+          bash tests/rollback-transaction.sh
       - name: ShellCheck
         run: shellcheck -S error -x cross.sh tests/*.sh scripts/*.sh
